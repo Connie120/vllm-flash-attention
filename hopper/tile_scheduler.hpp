@@ -488,6 +488,7 @@ public:
         int m_blocks_in_group = __shfl_sync(0xffffffff, num_m_blocks_cumulative, cutlass::NumThreadsPerWarp - 1);
         // Only the lower 16 bits are the actual bidh
         int current_bidh = !Split ? current_work.bidh : (current_work.bidh & 0x0000FFFF);
+        // Start tile of the current batch + an estimate of the total tiles within the group
         int group_end_tile = current_work.tile_idx - current_work.block - current_bidh * __shfl_sync(0xffffffff, num_split_m_blocks, 0 /*lane*/) + m_blocks_in_group * params.num_head;  // Same for all lanes
         if constexpr (Split) {
             int current_split_idx = (current_work.bidh & 0x00FF0000) >> 16;

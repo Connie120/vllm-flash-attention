@@ -109,7 +109,7 @@ public:
             CollectiveMainloop::to_underlying_arguments(args.mainloop),
             CollectiveEpilogue::to_underlying_arguments(args.epilogue),
             hw_info,
-            TileScheduler::to_underlying_arguments(args.scheduler)
+            TileScheduler::to_underlying_arguments(args.scheduler, sm_count)
         };
     }
 

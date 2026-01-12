@@ -166,6 +166,10 @@ struct Flash_fwd_params : public Qkv_params {
     int cp_world_size;
     int cp_rank;
     int *__restrict__ cp_tot_seqused_k;
+
+    // Ni: SM splitting for prefill/decode
+    float prefill_sm_percentage;  // Percentage of SMs dedicated to prefill (0.0-1.0)
+    int num_prefill_batches;  // Number of prefill batches (batches are ordered: prefill first, then decode)
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

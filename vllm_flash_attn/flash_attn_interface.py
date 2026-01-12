@@ -107,6 +107,8 @@ def get_scheduler_metadata(
     num_splits=0,    # Can be tuned for speed
     pack_gqa=None,   # Can be tuned for speed
     sm_margin=0,     # Can be tuned if some SMs are used for communication
+    prefill_sm_percentage=0.0,  # Percentage of SMs dedicated to prefill (0.0-1.0)
+    num_prefill_batches=0,  # Number of prefill batches (batches are ordered: prefill first, then decode)
 ):
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
@@ -128,6 +130,8 @@ def get_scheduler_metadata(
         num_splits,
         pack_gqa,
         sm_margin,
+        prefill_sm_percentage,
+        num_prefill_batches,
     )
 
     return scheduler_metadata
@@ -166,6 +170,8 @@ def flash_attn_varlen_func(
     cp_world_size=1,
     cp_rank=0,
     cp_tot_seqused_k=None,
+    prefill_sm_percentage=0.0,  # Percentage of SMs dedicated to prefill (0.0-1.0)
+    num_prefill_batches=0,  # Number of prefill batches (batches are ordered: prefill first, then decode)
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -304,6 +310,8 @@ def flash_attn_varlen_func(
             cp_world_size,
             cp_rank,
             cp_tot_seqused_k,
+            prefill_sm_percentage,
+            num_prefill_batches,
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")

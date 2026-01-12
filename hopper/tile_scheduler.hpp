@@ -610,17 +610,28 @@ public:
         //     printf("Before while, blockIdx.x = %d, threadIdx.x = %d, bidb = %d, num_m_blocks = %d, next_tile_idx = %d, cur tile_idx = %d, cur block = %d, cur bidh = %d, num_split_m_blocks = %d, group_end_tile = %d, m_blocks_in_group = %d\n", blockIdx.x, threadIdx.x, current_work.bidb, num_m_blocks, next_tile_idx, current_work.tile_idx, current_work.block, current_bidh, num_split_m_blocks, group_end_tile, m_blocks_in_group);
         // }
         // if (threadIdx.x == 0 && blockIdx.x == 0) { printf("tile_idx = %d, group_end_tile = %d, num_m_blocks_cumulative = %d, m_blocks_in_group = %d\n", current_work.tile_idx, group_end_tile, num_m_blocks_cumulative, m_blocks_in_group); }
+        // if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
+        //     printf("[WHILE_START] SM=%d, next_tile_idx=%d, group_end_tile=%d, bidb=%d, batch_end=%d, condition=%d\n",
+        //         int(blockIdx.x), next_tile_idx, group_end_tile, bidb, batch_end, (group_end_tile <= next_tile_idx) ? 1 : 0);
+        // }
+        int loop_iter = 0;
         while (group_end_tile <= next_tile_idx) {
+            // loop_iter++;
+            // if (threadIdx.x % cutlass::NumThreadsPerWarp == 0 && loop_iter <= 10) {
+            //     printf("[WHILE_ITER] SM=%d, iter=%d, next_tile_idx=%d, group_end_tile=%d, bidb=%d, batch_end=%d, m_blocks_in_group=%d\n",
+            //         int(blockIdx.x), loop_iter, next_tile_idx, group_end_tile, bidb, batch_end, m_blocks_in_group);
+            // }
             bidb += cutlass::NumThreadsPerWarp - 1;
-            // Ni: If prefill_sm_percentage != 0, check if the next batch group would exceed our SM group's batch range
-            // When prefill_sm_percentage == 0.0f, we use unified scheduling and rely on get_num_m_blocks returning 0
-            // when bidb >= num_batch, which makes m_blocks_in_group = 0 and stops group_end_tile from advancing
-            if (params.prefill_sm_percentage != 0.0f && bidb >= batch_end) {
-                // We've searched through all batches in our SM group's range and didn't find the tile
-                // This means next_tile_idx is beyond the tiles available for this SM group
-                // if (blockIdx.x <= 9 && threadIdx.x == 0) {
-                //     printf("Returning early, blockIdx.x = %d, threadIdx.x = %d, bidb = %d, num_m_blocks = %d, next_tile_idx = %d, group_end_tile = %d, m_blocks_in_group = %d\n", blockIdx.x, threadIdx.x, bidb, num_m_blocks, next_tile_idx, group_end_tile, m_blocks_in_group);
-                // }
+            // Ni: Check if we've exhausted all batches. When bidb >= batch_end (or num_batch when unified),
+            // get_num_m_blocks returns 0, making m_blocks_in_group = 0, so group_end_tile doesn't advance.
+            // If next_tile_idx is very large, the loop would run forever. This check prevents that.
+            if (bidb >= batch_end) {
+                // We've searched through all batches and didn't find the tile
+                // This means next_tile_idx is beyond the tiles available
+                if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
+                    printf("[WHILE_EXIT] SM=%d, bidb=%d >= batch_end=%d, returning invalid tile\n",
+                        int(blockIdx.x), bidb, batch_end);
+                }
                 return {next_tile_idx, 0, 0, params.num_batch};
             }
             
@@ -654,9 +665,14 @@ public:
                 group_end_tile += m_blocks_in_group * params.num_head;
             }
             // If no matching batches (m_blocks_in_group == 0), the loop will continue and try the next group
-            // if (blockIdx.x <= 9 && threadIdx.x == 0) {
-            //     printf("Bottom of while, blockIdx.x = %d, threadIdx.x = %d, bidb = %d, num_m_blocks = %d, next_tile_idx = %d, group_end_tile = %d, m_blocks_in_group = %d\n", blockIdx.x, threadIdx.x, bidb, num_m_blocks, next_tile_idx, group_end_tile, m_blocks_in_group);
-            // }
+            if (threadIdx.x % cutlass::NumThreadsPerWarp == 0 && loop_iter <= 10) {
+                printf("[WHILE_END] SM=%d, iter=%d, next_tile_idx=%d, group_end_tile=%d, bidb=%d, m_blocks_in_group=%d, condition=%d\n",
+                    int(blockIdx.x), loop_iter, next_tile_idx, group_end_tile, bidb, m_blocks_in_group, (group_end_tile <= next_tile_idx) ? 1 : 0);
+            }
+        }
+        if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
+            printf("[WHILE_DONE] SM=%d, next_tile_idx=%d, group_end_tile=%d, bidb=%d, exited loop\n",
+                int(blockIdx.x), next_tile_idx, group_end_tile, bidb);
         }
         int group_start_tile = group_end_tile - m_blocks_in_group * params.num_head;
         // The next problem to process is the first one that does not have ending tile position
@@ -783,7 +799,11 @@ public:
         if (threadIdx.x % NumProducerThreads == 0) {
             // Ni: If prefill_sm_percentage is 0, use original unified scheduling (no partitioning)
             if (params.prefill_sm_percentage == 0.0f) {
+                int old_tile_idx = current_work.tile_idx;
                 current_work.tile_idx = atomicAdd(params.tile_count_semaphore, 1) + int(gridDim.x);
+                // Debug: Print when fetching next tile (unified scheduling)
+                printf("[FETCH] SM=%d (group=unified), old_tile_idx=%d -> new_tile_idx=%d (semaphore_val=%d)\n",
+                    int(blockIdx.x), old_tile_idx, current_work.tile_idx, current_work.tile_idx - int(gridDim.x));
                 return;
             }
             

@@ -317,6 +317,8 @@ def main():
                         help='Use contiguous (sequential) block allocation instead of scattered blocks')
     parser.add_argument('--flush-cache', action='store_true',
                         help='Thrash L2 cache before each benchmark run to ensure cold cache (avoids cache effects)')
+    parser.add_argument('--prefill-sm-percentage', type=float, default=0.5,
+                        help='Percentage of SMs dedicated to prefill (0.0-1.0). Default: 0.5 (50%% prefill, 50%% decode)')
     
     args = parser.parse_args()
     
@@ -368,6 +370,7 @@ def main():
     print(f"nheads-q: {nheads_q}, nheads-kv: {nheads_kv}")
     print(f"Page size: {args.page_size if args.page_size is not None else 'None (no paging)'}")
     print(f"Block allocation: {'Contiguous (sequential)' if args.contiguous_blocks else 'Scattered (non-sequential)'}")
+    print(f"Prefill SM percentage: {args.prefill_sm_percentage:.1%} ({args.prefill_sm_percentage*100:.0f}%% prefill, {(1-args.prefill_sm_percentage)*100:.0f}%% decode)")
     print("=" * 80)
     
     # ========== Combined Prefill + Decode in single batch ==========
@@ -914,6 +917,8 @@ def main():
             page_size=args.page_size,
             causal=causal_combined,
             window_size=(-1, -1),
+            prefill_sm_percentage=args.prefill_sm_percentage,
+            num_prefill_batches=batch_prefill,
         )
         sys.stdout.flush()  # Flush after get_scheduler_metadata to show its output
         sys.stderr.flush()
@@ -1098,6 +1103,8 @@ def main():
             'causal': causal_combined,
             'scheduler_metadata': scheduler_metadata,
             'fa_version': fa_version,
+            'prefill_sm_percentage': args.prefill_sm_percentage,
+            'num_prefill_batches': batch_prefill,
             'repeats': repeats,
             'verbose': True  # Set to True to see Timer output showing all repeats
         }

@@ -565,7 +565,9 @@ mha_fwd_get_scheduler_metadata(
         bool has_softcap,
         int num_splits,
         std::optional<bool> pack_gqa_,
-        int const sm_margin
+        int const sm_margin,
+        float prefill_sm_percentage,
+        int num_prefill_batches
         ) {
 
     TORCH_CHECK(qkv_dtype == at::ScalarType::Half || qkv_dtype == at::ScalarType::BFloat16 || qkv_dtype == at::ScalarType::Float8_e4m3fn,
@@ -639,17 +641,34 @@ mha_fwd_get_scheduler_metadata(
 
     auto opts = seqused_k.options();
     // This needs to be set after get_num_splits
-    at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
+    // Original code (commented out):
+    // at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
+    // bool const scheduler_needs_semaphore = params.arch >= 90 || params.num_splits > 1;
+    // if (scheduler_needs_semaphore || use_dynamic_split) {
+    //     tile_count_semaphore = torch::empty({int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b}, opts.dtype(torch::kInt32));
+    //     if (scheduler_needs_semaphore) {
+    //         if (!use_dynamic_split) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
+    //         params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
+    //     } else {
+    //         params.tile_count_semaphore = nullptr;
+    //     }
+    //     params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
+    // }
+    
+    // For partitioned scheduling, we need 2 semaphores (prefill + decode) plus optionally num_splits_dynamic
+    at::Tensor tile_count_semaphore;  // Contains [prefill_semaphore, decode_semaphore] and optionally num_splits_dynamic
     bool const scheduler_needs_semaphore = params.arch >= 90 || params.num_splits > 1;
     if (scheduler_needs_semaphore || use_dynamic_split) {
-        tile_count_semaphore = torch::empty({int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b}, opts.dtype(torch::kInt32));
+        // Allocate space for 2 semaphores (prefill + decode) plus optionally num_splits_dynamic
+        int semaphore_count = scheduler_needs_semaphore ? 2 : 0;  // Two semaphores for partitioned scheduling
+        tile_count_semaphore = torch::empty({semaphore_count + int(use_dynamic_split) * params.b}, opts.dtype(torch::kInt32));
         if (scheduler_needs_semaphore) {
             if (!use_dynamic_split) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
             params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
         } else {
             params.tile_count_semaphore = nullptr;
         }
-        params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
+        params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + semaphore_count : nullptr;
     }
 
     if (params.num_splits_dynamic_ptr) {
@@ -710,7 +729,9 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         std::optional<const at::Tensor> &s_aux_, // (h)
         int const cp_world_size,  // context parallelism (cp) world size
         int const cp_rank,         // cp rank
-        std::optional<const at::Tensor> &cp_tot_seqused_k_ // b. total seqused_k in cp world
+        std::optional<const at::Tensor> &cp_tot_seqused_k_, // b. total seqused_k in cp world
+        float prefill_sm_percentage,  // Percentage of SMs dedicated to prefill (0.0-1.0)
+        int num_prefill_batches   // Number of prefill batches (batches are ordered: prefill first, then decode)
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1003,13 +1024,42 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     params.pack_gqa |= (params.num_splits > 1);
 
     // This needs to be set after get_num_splits
-    at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
+    // Original code (commented out):
+    // at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
+    // // We don't use the persistent scheduler if Split and not Varlen
+    // bool const scheduler_needs_semaphore = params.arch >= 90
+    //     ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
+    //     : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
+    // if (scheduler_needs_semaphore || use_dynamic_split) {
+    //     int metadata_size = int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b;
+    //     params.skip_scheduler_metadata_computation = scheduler_metadata_.has_value();
+    //     if (scheduler_metadata_.has_value()) {
+    //         at::Tensor scheduler_metadata = scheduler_metadata_.value();
+    //         CHECK_DEVICE(scheduler_metadata);
+    //         CHECK_SHAPE(scheduler_metadata, metadata_size);
+    //         CHECK_CONTIGUOUS(scheduler_metadata);
+    //         TORCH_CHECK(scheduler_metadata.dtype() == torch::kInt32, "scheduler_metadata must have dtype int32");
+    //         tile_count_semaphore = scheduler_metadata;
+    //     } else {
+    //         tile_count_semaphore = torch::empty({metadata_size}, opts.dtype(torch::kInt32));
+    //     }
+    //     if (scheduler_needs_semaphore && !use_dynamic_split) {
+    //         tile_count_semaphore.zero_();  // If varlen we'll manually do the zero-ing
+    //     }
+    //     params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() : nullptr;
+    //     params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
+    // }
+    
+    // For partitioned scheduling, we need 2 semaphores (prefill + decode) plus optionally num_splits_dynamic
+    at::Tensor tile_count_semaphore;  // Contains [prefill_semaphore, decode_semaphore] and optionally num_splits_dynamic
     // We don't use the persistent scheduler if Split and not Varlen
     bool const scheduler_needs_semaphore = params.arch >= 90
         ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
         : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
     if (scheduler_needs_semaphore || use_dynamic_split) {
-        int metadata_size = int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b;
+        // Allocate space for 2 semaphores (prefill + decode) plus optionally num_splits_dynamic
+        int semaphore_count = scheduler_needs_semaphore ? 2 : 0;  // Two semaphores for partitioned scheduling
+        int metadata_size = semaphore_count + int(use_dynamic_split) * params.b;
         params.skip_scheduler_metadata_computation = scheduler_metadata_.has_value();
         if (scheduler_metadata_.has_value()) {
             at::Tensor scheduler_metadata = scheduler_metadata_.value();
@@ -1025,7 +1075,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
             tile_count_semaphore.zero_();  // If varlen we'll manually do the zero-ing
         }
         params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() : nullptr;
-        params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
+        params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + semaphore_count : nullptr;
     }
 
     if (q_v_.has_value()) {
@@ -1165,6 +1215,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
 
     params.cp_world_size = cp_world_size;
     params.cp_rank = cp_rank;
+    params.prefill_sm_percentage = prefill_sm_percentage;  // Use passed parameter instead of hardcoded default
+    params.num_prefill_batches = num_prefill_batches;  // Use passed parameter instead of hardcoded default
     params.cp_tot_seqused_k = cp_tot_seqused_k_.has_value() ?
       static_cast<int *>(cp_tot_seqused_k_.value().data_ptr()) : nullptr;
     TORCH_CHECK(cp_world_size > 0, "cp_world_size must be positive, required by downstream unified code path. Use 1 if CP is not enabled.");

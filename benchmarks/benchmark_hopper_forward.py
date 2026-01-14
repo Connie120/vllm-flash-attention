@@ -925,6 +925,7 @@ def main():
             page_size=args.page_size,
             causal=causal_combined,
             window_size=(-1, -1),
+            num_splits=1,  # Always set to 1 to match flash_attn_varlen_func
             prefill_sm_percentage=args.prefill_sm_percentage,
             num_prefill_batches=batch_prefill,
         )
@@ -1090,7 +1091,7 @@ def main():
         if block_table_combined is not None:
             print(f"  block_table first row: {block_table_combined[0].cpu().numpy()}")
         print(f"fa_version: {fa_version}")
-        print(f"num_splits: 0 (not set in script)")
+        print(f"num_splits: 1 (always set to 1)")
         print(f"q_descale: None (not set in script)")
         print(f"k_descale: None (not set in script)")
         print(f"v_descale: None (not set in script)")
@@ -1111,6 +1112,7 @@ def main():
             'causal': causal_combined,
             'scheduler_metadata': scheduler_metadata,
             'fa_version': fa_version,
+            'num_splits': 1,  # Always set to 1
             'prefill_sm_percentage': args.prefill_sm_percentage,
             'num_prefill_batches': batch_prefill,
             'tile_scheduler_debug': args.tile_scheduler_debug,

@@ -170,6 +170,16 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         CHECK_CUDA_KERNEL_LAUNCH();
     }
 
+    // Ni: Reset semaphores before each kernel launch to handle repeats > 1
+    // For partitioned scheduling, we have 2 semaphores (prefill and decode)
+    // prepare_varlen_num_blocks zeros them when called, but we need to reset them
+    // even when skip_scheduler_metadata_computation is true
+    if (params.tile_count_semaphore != nullptr) {
+        // Zero both semaphores (prefill and decode) for partitioned scheduling
+        // Safe to zero both even if only one exists (second location might be part of num_splits_dynamic)
+        CHECK_CUDA(cudaMemsetAsync(params.tile_count_semaphore, 0, 2 * sizeof(int), stream));
+    }
+
     int device;
     CHECK_CUDA(cudaGetDevice(&device));
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({

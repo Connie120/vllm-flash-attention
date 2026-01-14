@@ -34,7 +34,12 @@ __global__ void prepare_varlen_num_blocks_kernel(
     if (threadIdx.x < kSmemSize) { total_blocks_smem[threadIdx.x] = 0; }
     __syncthreads();
 
-    if (threadIdx.x == 0 && tile_count_semaphore) { *tile_count_semaphore = 0; }
+    // Ni: Zero both semaphores (prefill and decode) for partitioned scheduling
+    // If only one semaphore exists, zeroing the second location is safe (it's either unused or part of num_splits_dynamic)
+    if (threadIdx.x == 0 && tile_count_semaphore) {
+        tile_count_semaphore[0] = 0;  // Prefill semaphore
+        tile_count_semaphore[1] = 0;  // Decode semaphore (safe to zero even if not used)
+    }
 
     int lane = threadIdx.x % cutlass::NumThreadsPerWarp;
 

@@ -148,7 +148,7 @@ def thrash_l2_cache(device='cuda'):
     del flush_tensors
 
 
-def benchmark_forward(fn, *inputs, repeats=10, desc="", verbose=True, flush_cache=False, **kwinputs):
+def benchmark_forward(fn, *inputs, repeats=10, desc="", verbose=True, flush_cache=False, warmup=True, **kwinputs):
     """Use Pytorch Benchmark on the forward pass of an arbitrary function.
     
     Args:
@@ -158,6 +158,7 @@ def benchmark_forward(fn, *inputs, repeats=10, desc="", verbose=True, flush_cach
         desc: Description string
         verbose: Whether to print timing information
         flush_cache: If True, thrash L2 cache before each run to ensure cold cache
+        warmup: If True, perform warmup runs before timing (default: True)
         **kwinputs: Keyword arguments for fn
     """
     if verbose:
@@ -165,12 +166,13 @@ def benchmark_forward(fn, *inputs, repeats=10, desc="", verbose=True, flush_cach
     
     # For single runs, use simple timing to avoid PyTorch Timer's automatic warmup
     if repeats == 1:
-        # Do one warmup run
-        if flush_cache and torch.cuda.is_available():
-            thrash_l2_cache(device='cuda')
-        fn(*inputs, **kwinputs)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        # Do one warmup run (if enabled)
+        if warmup:
+            if flush_cache and torch.cuda.is_available():
+                thrash_l2_cache(device='cuda')
+            fn(*inputs, **kwinputs)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
         
         # Single timed run
         if flush_cache and torch.cuda.is_available():
@@ -204,7 +206,8 @@ def benchmark_forward(fn, *inputs, repeats=10, desc="", verbose=True, flush_cach
         m = MockMeasurement(elapsed_time)
         t = None  # No Timer object for single runs
         if verbose:
-            print(f"Single run: {elapsed_time*1000:.3f} ms")
+            warmup_info = " (with warmup)" if warmup else " (no warmup)"
+            print(f"Single run{warmup_info}: {elapsed_time*1000:.3f} ms")
         return t, m
     
     # For multiple repeats, use PyTorch Timer (which does automatic warmup)
@@ -277,19 +280,20 @@ def efficiency(flop, time):
     return (flop / time / 10**12) if not math.isnan(time) and time > 0 else 0.0
 
 
-def time_forward(func, *args, flush_cache=False, **kwargs):
+def time_forward(func, *args, flush_cache=False, warmup=True, **kwargs):
     """Benchmark forward pass only.
     
     Args:
         func: Function to benchmark
         *args: Positional arguments for func
         flush_cache: If True, thrash L2 cache before each run to ensure cold cache
+        warmup: If True, perform warmup runs before timing (default: True)
         **kwargs: Keyword arguments for func (repeats, verbose, etc.)
     
     Returns:
         Mean forward time in seconds
     """
-    time_f = benchmark_forward(func, *args, flush_cache=flush_cache, **kwargs)
+    time_f = benchmark_forward(func, *args, flush_cache=flush_cache, warmup=warmup, **kwargs)
     return time_f[1].mean
 
 
@@ -317,8 +321,12 @@ def main():
                         help='Use contiguous (sequential) block allocation instead of scattered blocks')
     parser.add_argument('--flush-cache', action='store_true',
                         help='Thrash L2 cache before each benchmark run to ensure cold cache (avoids cache effects)')
-    parser.add_argument('--prefill-sm-percentage', type=float, default=0.5,
-                        help='Percentage of SMs dedicated to prefill (0.0-1.0). Default: 0.5 (50%% prefill, 50%% decode)')
+    parser.add_argument('--prefill-sm-percentage', type=float, default=0.0,
+                        help='Percentage of SMs dedicated to prefill (0.0-0.9). Default: 0.5 (50%% prefill, 50%% decode)')
+    parser.add_argument('--no-warmup', action='store_true',
+                        help='Skip warmup runs before timing (default: warmup is enabled)')
+    parser.add_argument('--tile-scheduler-debug', action='store_true',
+                        help='Enable printf debug output in tile scheduler (default: disabled)')
     
     args = parser.parse_args()
     
@@ -1105,6 +1113,7 @@ def main():
             'fa_version': fa_version,
             'prefill_sm_percentage': args.prefill_sm_percentage,
             'num_prefill_batches': batch_prefill,
+            'tile_scheduler_debug': args.tile_scheduler_debug,
             'repeats': repeats,
             'verbose': True  # Set to True to see Timer output showing all repeats
         }
@@ -1124,6 +1133,7 @@ def main():
         f_combined = time_forward(
             flash_attn_varlen_func,
             flush_cache=args.flush_cache,
+            warmup=not args.no_warmup,
             **func_kwargs
         )
         

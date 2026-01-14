@@ -162,6 +162,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         // Ni: SM splitting for prefill/decode
         params.prefill_sm_percentage,
         params.num_prefill_batches,
+        params.tile_scheduler_debug,
     };
 
     if (Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation) {

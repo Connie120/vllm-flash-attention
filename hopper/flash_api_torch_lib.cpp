@@ -57,7 +57,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         int const cp_rank,
         std::optional<const at::Tensor> &cp_tot_seqused_k,
         float prefill_sm_percentage,
-        int num_prefill_batches
+        int num_prefill_batches,
+        std::optional<bool> tile_scheduler_debug_
 );
 
 // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
@@ -132,7 +133,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
         "    int      cp_rank,"
         "    Tensor?  cp_tot_seqused_k,"
         "    float    prefill_sm_percentage,"
-        "    int      num_prefill_batches) -> Tensor[]");
+        "    int      num_prefill_batches,"
+        "    bool?    tile_scheduler_debug = None) -> Tensor[]");
     ops.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
 
     ops.def("get_scheduler_metadata("

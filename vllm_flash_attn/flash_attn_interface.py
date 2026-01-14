@@ -172,6 +172,7 @@ def flash_attn_varlen_func(
     cp_tot_seqused_k=None,
     prefill_sm_percentage=0.0,  # Percentage of SMs dedicated to prefill (0.0-1.0)
     num_prefill_batches=0,  # Number of prefill batches (batches are ordered: prefill first, then decode)
+    tile_scheduler_debug=False,  # If true, enables printf debug output in tile scheduler
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -312,6 +313,7 @@ def flash_attn_varlen_func(
             cp_tot_seqused_k,
             prefill_sm_percentage,
             num_prefill_batches,
+            tile_scheduler_debug,
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")

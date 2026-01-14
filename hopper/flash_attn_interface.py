@@ -52,7 +52,8 @@ def _flash_attn_forward(
         s_aux=None,
         cp_world_size=1,
         cp_rank=0,
-        cp_tot_seqused_k=None):
+        cp_tot_seqused_k=None,
+        tile_scheduler_debug=False):
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
     cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
@@ -64,45 +65,95 @@ def _flash_attn_forward(
     ]
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     seqlens_rotary = maybe_contiguous(seqlens_rotary)
-    out, softmax_lse, *rest = flash_attn_3_cuda.fwd(
-        q,
-        k,
-        v,
-        k_new,
-        v_new,
-        qv,
-        out,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        cu_seqlens_k_new,
-        seqused_q,
-        seqused_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        page_table,
-        kv_batch_idx,
-        leftpad_k,
-        rotary_cos,
-        rotary_sin,
-        seqlens_rotary,
-        q_descale,
-        k_descale,
-        v_descale,
-        softmax_scale,
-        causal,
-        window_size[0],
-        window_size[1],
-        softcap,
-        rotary_interleaved,
-        scheduler_metadata,
-        num_splits,
-        pack_gqa,
-        sm_margin,
-        s_aux,
-        cp_world_size,
-        cp_rank,
-        cp_tot_seqused_k,
-    )
+    # Try calling with tile_scheduler_debug parameter (new extension)
+    # If it fails, fall back to calling without it (old extension)
+    try:
+        out, softmax_lse, *rest = flash_attn_3_cuda.fwd(
+            q,
+            k,
+            v,
+            k_new,
+            v_new,
+            qv,
+            out,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            cu_seqlens_k_new,
+            seqused_q,
+            seqused_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            page_table,
+            kv_batch_idx,
+            leftpad_k,
+            rotary_cos,
+            rotary_sin,
+            seqlens_rotary,
+            q_descale,
+            k_descale,
+            v_descale,
+            softmax_scale,
+            causal,
+            window_size[0],
+            window_size[1],
+            softcap,
+            rotary_interleaved,
+            scheduler_metadata,
+            num_splits,
+            pack_gqa,
+            sm_margin,
+            s_aux,
+            cp_world_size,
+            cp_rank,
+            cp_tot_seqused_k,
+            tile_scheduler_debug,
+        )
+    except TypeError:
+        # Old extension doesn't support tile_scheduler_debug parameter
+        # Call without it (debug will be disabled)
+        if tile_scheduler_debug:
+            import warnings
+            warnings.warn("tile_scheduler_debug is requested but the installed extension doesn't support it. "
+                         "Rebuild the extension to enable debug output.")
+        out, softmax_lse, *rest = flash_attn_3_cuda.fwd(
+            q,
+            k,
+            v,
+            k_new,
+            v_new,
+            qv,
+            out,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            cu_seqlens_k_new,
+            seqused_q,
+            seqused_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            page_table,
+            kv_batch_idx,
+            leftpad_k,
+            rotary_cos,
+            rotary_sin,
+            seqlens_rotary,
+            q_descale,
+            k_descale,
+            v_descale,
+            softmax_scale,
+            causal,
+            window_size[0],
+            window_size[1],
+            softcap,
+            rotary_interleaved,
+            scheduler_metadata,
+            num_splits,
+            pack_gqa,
+            sm_margin,
+            s_aux,
+            cp_world_size,
+            cp_rank,
+            cp_tot_seqused_k,
+        )
     return out, softmax_lse, *rest
 
 
@@ -366,6 +417,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         cp_world_size=1,
         cp_rank=0,
         cp_tot_seqused_k=0,
+        tile_scheduler_debug=False,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
@@ -398,6 +450,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             cp_world_size=cp_world_size,
             cp_rank=cp_rank,
             cp_tot_seqused_k=cp_tot_seqused_k,
+            tile_scheduler_debug=tile_scheduler_debug,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -609,6 +662,7 @@ def flash_attn_varlen_func(
     cp_world_size=1,
     cp_rank=0,
     cp_tot_seqused_k=None,
+    tile_scheduler_debug=False,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -634,6 +688,7 @@ def flash_attn_varlen_func(
         cp_world_size,
         cp_rank,
         cp_tot_seqused_k,
+        tile_scheduler_debug,
     )
 
 

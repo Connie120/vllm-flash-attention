@@ -731,8 +731,10 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         int const cp_rank,         // cp rank
         std::optional<const at::Tensor> &cp_tot_seqused_k_, // b. total seqused_k in cp world
         float prefill_sm_percentage,  // Percentage of SMs dedicated to prefill (0.0-1.0)
-        int num_prefill_batches   // Number of prefill batches (batches are ordered: prefill first, then decode)
+        int num_prefill_batches,   // Number of prefill batches (batches are ordered: prefill first, then decode)
+        std::optional<bool> tile_scheduler_debug_  // If true, enables printf debug output in tile scheduler
         ) {
+    bool tile_scheduler_debug = tile_scheduler_debug_.value_or(false);
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm8x = dprops->major >= 8;
@@ -1217,6 +1219,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     params.cp_rank = cp_rank;
     params.prefill_sm_percentage = prefill_sm_percentage;  // Use passed parameter instead of hardcoded default
     params.num_prefill_batches = num_prefill_batches;  // Use passed parameter instead of hardcoded default
+    params.tile_scheduler_debug = tile_scheduler_debug;
     params.cp_tot_seqused_k = cp_tot_seqused_k_.has_value() ?
       static_cast<int *>(cp_tot_seqused_k_.value().data_ptr()) : nullptr;
     TORCH_CHECK(cp_world_size > 0, "cp_world_size must be positive, required by downstream unified code path. Use 1 if CP is not enabled.");
@@ -1265,8 +1268,9 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
             // This will zero out the semaphore if needed
             run_mha_fwd_combine(params, stream, true /*enable_pdl*/);
         } else if (scheduler_needs_semaphore && params.skip_scheduler_metadata_computation) {
-            // need to zero out the semaphore in this case
-            tile_count_semaphore.index({torch::indexing::Slice(0, 1)}).zero_();
+            // need to zero out the semaphores in this case (both prefill and decode for partitioned scheduling)
+            int semaphore_count = 2;  // Two semaphores for partitioned scheduling
+            tile_count_semaphore.index({torch::indexing::Slice(0, semaphore_count)}).zero_();
         }
     } else if (total_q > 0 && num_heads_k > 0) {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.

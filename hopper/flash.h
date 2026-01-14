@@ -170,6 +170,9 @@ struct Flash_fwd_params : public Qkv_params {
     // Ni: SM splitting for prefill/decode
     float prefill_sm_percentage;  // Percentage of SMs dedicated to prefill (0.0-1.0)
     int num_prefill_batches;  // Number of prefill batches (batches are ordered: prefill first, then decode)
+    
+    // Debug flag for tile scheduler printf output
+    bool tile_scheduler_debug;  // If true, enables printf debug output in tile scheduler
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

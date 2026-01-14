@@ -32,6 +32,8 @@ struct TileSchedulerArguments {
     // SM splitting for prefill/decode
     float const prefill_sm_percentage = 0.0f;  // Percentage of SMs dedicated to prefill (0.0-1.0)
     int const num_prefill_batches = 0;  // Number of prefill batches (batches are ordered: prefill first, then decode)
+    // Debug flag for tile scheduler printf output
+    bool const tile_scheduler_debug = false;  // If true, enables printf debug output in tile scheduler
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -400,6 +402,7 @@ public:
         float const prefill_sm_percentage;
         int const num_sm;
         int const num_prefill_batches;  // Number of prefill batches (batches are ordered: prefill first, then decode)
+        bool const tile_scheduler_debug;  // If true, enables printf debug output
     };
 
     static Params
@@ -435,7 +438,8 @@ public:
                 // args.num_m_blocks_ptr,
                 args.num_splits_dynamic_ptr,
                 args.prefill_sm_percentage, num_sm,
-                args.num_prefill_batches};
+                args.num_prefill_batches,
+                args.tile_scheduler_debug};
     }
 
     static dim3
@@ -628,7 +632,7 @@ public:
             if (bidb >= batch_end) {
                 // We've searched through all batches and didn't find the tile
                 // This means next_tile_idx is beyond the tiles available
-                if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
+                if (params.tile_scheduler_debug && threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
                     printf("[WHILE_EXIT] SM=%d, bidb=%d >= batch_end=%d, returning invalid tile\n",
                         int(blockIdx.x), bidb, batch_end);
                 }
@@ -665,12 +669,12 @@ public:
                 group_end_tile += m_blocks_in_group * params.num_head;
             }
             // If no matching batches (m_blocks_in_group == 0), the loop will continue and try the next group
-            if (threadIdx.x % cutlass::NumThreadsPerWarp == 0 && loop_iter <= 10) {
+            if (params.tile_scheduler_debug && threadIdx.x % cutlass::NumThreadsPerWarp == 0 && loop_iter <= 10) {
                 printf("[WHILE_END] SM=%d, iter=%d, next_tile_idx=%d, group_end_tile=%d, bidb=%d, m_blocks_in_group=%d, condition=%d\n",
                     int(blockIdx.x), loop_iter, next_tile_idx, group_end_tile, bidb, m_blocks_in_group, (group_end_tile <= next_tile_idx) ? 1 : 0);
             }
         }
-        if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
+        if (params.tile_scheduler_debug && threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
             printf("[WHILE_DONE] SM=%d, next_tile_idx=%d, group_end_tile=%d, bidb=%d, exited loop\n",
                 int(blockIdx.x), next_tile_idx, group_end_tile, bidb);
         }
@@ -716,7 +720,7 @@ public:
         //     printf("Before returning, blockIdx.x = %d, threadIdx.x = %d, group_start_tile = %d, batch_idx_in_group = %d, bidb = %d, num_m_blocks = %d, next_tile_idx = %d, group_end_tile = %d, m_blocks_in_group = %d, mh_block = %d, bidh = %d, block = %d\n", blockIdx.x, threadIdx.x, group_start_tile, batch_idx_in_group, bidb, num_m_blocks, next_tile_idx, group_end_tile, m_blocks_in_group, mh_block, bidh, block);
         // }
         // Ni Debug: Print tile assignment result (batch_start and batch_end are defined earlier in the function)
-        if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
+        if (params.tile_scheduler_debug && threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
             bool is_valid_tile = bidb < params.num_batch;
             printf("[TILE] SM=%d (group=%s), tile_idx=%d -> (block=%d, bidh=%d, bidb=%d), valid=%d, batch_range=[%d,%d)\n",
                 int(blockIdx.x),
@@ -739,10 +743,12 @@ public:
                 if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
                     *work_info_smem = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);
                     // Ni Debug: Print initial tile assignment (unified scheduling)
-                    printf("[INIT] SM=%d (group=unified), tile_idx=%d -> (block=%d, bidh=%d, bidb=%d), valid=%d\n",
-                        int(blockIdx.x),
-                        work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb,
-                        work_info.is_valid(params) ? 1 : 0);
+                    if (params.tile_scheduler_debug) {
+                        printf("[INIT] SM=%d (group=unified), tile_idx=%d -> (block=%d, bidh=%d, bidb=%d), valid=%d\n",
+                            int(blockIdx.x),
+                            work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb,
+                            work_info.is_valid(params) ? 1 : 0);
+                    }
                 }
                 flash::named_barrier_arrive(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1 /*id*/);  // TileCountSmemFull
                 return work_info;
@@ -773,12 +779,14 @@ public:
             if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
                 *work_info_smem = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);
                 // Ni Debug: Print initial tile assignment
-                printf("[INIT] SM=%d (group=%s, sm_in_group=%d), tile_idx=%d -> (block=%d, bidh=%d, bidb=%d), valid=%d\n",
-                    int(blockIdx.x),
-                    is_prefill_sm_group ? "prefill" : "decode",
-                    is_prefill_sm_group ? sm_id : (sm_id - num_prefill_sm),
-                    work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb,
-                    work_info.is_valid(params) ? 1 : 0);
+                if (params.tile_scheduler_debug) {
+                    printf("[INIT] SM=%d (group=%s, sm_in_group=%d), tile_idx=%d -> (block=%d, bidh=%d, bidb=%d), valid=%d\n",
+                        int(blockIdx.x),
+                        is_prefill_sm_group ? "prefill" : "decode",
+                        is_prefill_sm_group ? sm_id : (sm_id - num_prefill_sm),
+                        work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb,
+                        work_info.is_valid(params) ? 1 : 0);
+                }
             }
             flash::named_barrier_arrive(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1 /*id*/);  // TileCountSmemFull
             return work_info;
@@ -801,9 +809,11 @@ public:
             if (params.prefill_sm_percentage == 0.0f) {
                 int old_tile_idx = current_work.tile_idx;
                 current_work.tile_idx = atomicAdd(params.tile_count_semaphore, 1) + int(gridDim.x);
-                // Debug: Print when fetching next tile (unified scheduling)
-                printf("[FETCH] SM=%d (group=unified), old_tile_idx=%d -> new_tile_idx=%d (semaphore_val=%d)\n",
-                    int(blockIdx.x), old_tile_idx, current_work.tile_idx, current_work.tile_idx - int(gridDim.x));
+                // Debug: Print when fetching next tile (unified scheduling) - only from thread 0 per block
+                if (params.tile_scheduler_debug && threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
+                    printf("[FETCH] SM=%d (group=unified), old_tile_idx=%d -> new_tile_idx=%d (semaphore_val=%d)\n",
+                        int(blockIdx.x), old_tile_idx, current_work.tile_idx, current_work.tile_idx - int(gridDim.x));
+                }
                 return;
             }
             
@@ -814,14 +824,20 @@ public:
                 ? int(params.num_sm * params.prefill_sm_percentage + 0.5f)
                 : (params.num_sm - int(params.num_sm * params.prefill_sm_percentage + 0.5f));
             int old_tile_idx = current_work.tile_idx;
+            // Ni: Debug: Print semaphore value before atomicAdd to see if it's already non-zero
+            int semaphore_val_before = *semaphore;
             current_work.tile_idx = atomicAdd(semaphore, 1) + num_sm_for_group;
-            // Debug: Print when fetching next tile
-            printf("[FETCH] SM=%d (group=%s), old_tile_idx=%d -> new_tile_idx=%d (semaphore_val=%d)\n",
-                int(blockIdx.x),
-                is_prefill_sm_group ? "prefill" : "decode",
-                old_tile_idx,
-                current_work.tile_idx,
-                current_work.tile_idx - num_sm_for_group);
+            // Debug: Print when fetching next tile - only from thread 0 per block
+            if (params.tile_scheduler_debug && threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
+                printf("[FETCH] SM=%d (group=%s), old_tile_idx=%d -> new_tile_idx=%d (semaphore_val=%d, semaphore_before=%d, semaphore_ptr_diff=%ld)\n",
+                    int(blockIdx.x),
+                    is_prefill_sm_group ? "prefill" : "decode",
+                    old_tile_idx,
+                    current_work.tile_idx,
+                    current_work.tile_idx - num_sm_for_group,
+                    semaphore_val_before,
+                    (long)(semaphore - params.tile_count_semaphore));
+            }
         }
     }
 
@@ -838,12 +854,14 @@ public:
             if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
                 *work_info_smem = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);
                 // Debug: Print when getting next work tile
-                bool is_prefill_sm_group = is_prefill_sm(params);
-                printf("[NEXT] SM=%d (group=%s), tile_idx=%d -> (block=%d, bidh=%d, bidb=%d), valid=%d\n",
-                    int(blockIdx.x),
-                    is_prefill_sm_group ? "prefill" : "decode",
-                    work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb,
-                    work_info.is_valid(params) ? 1 : 0);
+                if (params.tile_scheduler_debug) {
+                    bool is_prefill_sm_group = is_prefill_sm(params);
+                    printf("[NEXT] SM=%d (group=%s), tile_idx=%d -> (block=%d, bidh=%d, bidb=%d), valid=%d\n",
+                        int(blockIdx.x),
+                        is_prefill_sm_group ? "prefill" : "decode",
+                        work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb,
+                        work_info.is_valid(params) ? 1 : 0);
+                }
             }
             flash::named_barrier_arrive(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1 /*id*/);  // TileCountSmemFull
             return work_info;

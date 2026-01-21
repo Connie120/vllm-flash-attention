@@ -376,10 +376,18 @@ class VarlenDynamicPersistentTileScheduler {
     static constexpr int NumThreads = WarpSpecialized ? NumMmaThreads + NumProducerThreads : NumMmaThreads;
 
 public:
-    using SharedStorage = int4;
+    // Ni: SharedStorage now includes work_info and group mapping
+    // Note: The kernel declares this with alignas(16), but we also add alignas(16) here
+    // to ensure proper alignment of the struct itself (especially for int4 work_info which needs 16-byte alignment)
+    // With alignas(16), the struct will be padded to 32 bytes (20 bytes actual + 12 bytes padding)
+    struct alignas(16) SharedStorage {
+        int4 work_info;  // tile_idx, block, bidh, bidb
+        int sm_group;    // 0 = decode, 1 = prefill
+    };
 
 protected:
-    SharedStorage* const work_info_smem;
+    SharedStorage* const smem_storage;  // Full struct to access sm_group
+    int4* const work_info_smem;        // Pointer to work_info member for int4 operations
 
 public:
 
@@ -481,7 +489,8 @@ public:
     };
 
     CUTLASS_DEVICE
-    VarlenDynamicPersistentTileScheduler(SharedStorage* const smem_scheduler) : work_info_smem(smem_scheduler) {};
+    VarlenDynamicPersistentTileScheduler(SharedStorage* const smem_scheduler) 
+        : smem_storage(smem_scheduler), work_info_smem(&smem_scheduler->work_info) {}
 
     // Ni: Helper function to determine if a batch is prefill (seqlen_q > 1) or decode (seqlen_q == 1)
     // Note: When PackGQA is enabled, seqlen is multiplied by qhead_per_khead, so we check
@@ -507,16 +516,33 @@ public:
     }
 
     // Ni: Helper function to check if current SM belongs to prefill group
+    // Uses mapping array stored in shared memory
     CUTLASS_DEVICE
     bool is_prefill_sm(Params const& params) const {
         // Ni: If prefill_sm_percentage is 0, use original unified scheduling (no partitioning)
-        // Return false (treat as decode) since we're using unified scheduling
         if (params.prefill_sm_percentage == 0.0f) {
             return false;
         }
-        int sm_id = int(blockIdx.x);
-        int prefill_sm_count = int(params.num_sm * params.prefill_sm_percentage + 0.5f);  // Round to nearest
-        return sm_id < prefill_sm_count;
+        // Ni: Read group mapping from shared memory (0 = decode, 1 = prefill)
+        // Ni: If not all the threads call this function, then broadcasting the value to other threads can have illegal memory access.
+        // Thread 0 reads from shared memory, then broadcasts to other threads
+        // int sm_group = 0;
+        // if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
+        //     sm_group = smem_storage->sm_group;
+        // }
+        // // Broadcast the value to other threads in the warp
+        // sm_group = __shfl_sync(0xffffffff, sm_group, 0);
+        return smem_storage->sm_group == 1;  // 1 = prefill, 0 = decode
+    }
+    
+    // Ni: Update the group mapping for this SM
+    CUTLASS_DEVICE
+    void set_sm_group(Params const& params, bool is_prefill) const {
+        // Ni: Only thread 0 writes to shared memory. All threads can read it later via is_prefill_sm()
+        // Shared memory writes are visible to all threads in the block, so no broadcast is needed here
+        if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
+            smem_storage->sm_group = is_prefill ? 1 : 0;
+        }
     }
 
     // Ni: Get the starting bidb for the current SM's batch group
@@ -600,14 +626,17 @@ public:
             int current_split_idx = (current_work.bidh & 0x00FF0000) >> 16;
             group_end_tile -= current_split_idx * __shfl_sync(0xffffffff, num_m_blocks, 0 /*lane*/);
         }
+        // Ni: Use mapping to determine batch range - is_prefill_sm() already reflects the current group
+        // after any switching, so get_batch_start/end will return the correct range
         bool is_prefill_sm_group = is_prefill_sm(params);
         int batch_start = get_batch_start(params);  // Start of this SM group's batch range
         int batch_end = get_batch_end(params);     // End (exclusive) of this SM group's batch range
         
         // Ni: Assert that current_work.bidb is within this SM group's batch range
         // When prefill_sm_percentage == 0, batch_start=0 and batch_end=num_batch, so this always passes for valid bidb
-        // get_initial_work sets the correct initial bidb, and subsequent calls should maintain it
-        assert(current_work.bidb >= batch_start && current_work.bidb < batch_end);
+        if (current_work.is_valid(params)) {
+            assert(current_work.bidb >= batch_start && current_work.bidb < batch_end);
+        }
         int bidb = current_work.bidb;
         
         // if (blockIdx.x <= 9 && threadIdx.x == 0) {
@@ -760,7 +789,14 @@ public:
             // This matches the semaphore pattern: atomicAdd(semaphore, 1) + num_sm_for_group
             // where semaphore starts at 0, so first value is num_sm_for_group
             // But for initial work, we want tile_idx relative to the group (0, 1, 2, ...)
-            bool is_prefill_sm_group = is_prefill_sm(params);
+            bool is_prefill_sm_group = (int(blockIdx.x) < int(params.num_sm * params.prefill_sm_percentage + 0.5f));
+            // Ni: Set the group mapping in shared memory using set_sm_group
+            // Only set sm_group if prefill_sm_percentage is non-zero to avoid illegal memory access
+            // when the struct size might not be properly accounted for
+            if (params.prefill_sm_percentage != 0.0f) {
+                set_sm_group(params, is_prefill_sm_group);
+                // __syncwarp();  // TODO: do we need this? Ensure all threads see the updated sm_group before tile_idx_to_work_tile reads it
+            }
             int sm_id = int(blockIdx.x);
             int num_prefill_sm = int(params.num_sm * params.prefill_sm_percentage + 0.5f);
             int initial_tile_idx;
@@ -817,26 +853,21 @@ public:
                 return;
             }
             
-            // Ni:Use separate semaphores for prefill and decode SMs
+            // Ni: Use mapping array to determine which group this SM belongs to
             bool is_prefill_sm_group = is_prefill_sm(params);
             int* semaphore = is_prefill_sm_group ? params.prefill_tile_count_semaphore : params.decode_tile_count_semaphore;
             int num_sm_for_group = is_prefill_sm_group 
                 ? int(params.num_sm * params.prefill_sm_percentage + 0.5f)
                 : (params.num_sm - int(params.num_sm * params.prefill_sm_percentage + 0.5f));
             int old_tile_idx = current_work.tile_idx;
-            // Ni: Debug: Print semaphore value before atomicAdd to see if it's already non-zero
-            int semaphore_val_before = *semaphore;
+            
+            // Fetch from current group's semaphore
             current_work.tile_idx = atomicAdd(semaphore, 1) + num_sm_for_group;
-            // Debug: Print when fetching next tile - only from thread 0 per block
             if (params.tile_scheduler_debug && threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
-                printf("[FETCH] SM=%d (group=%s), old_tile_idx=%d -> new_tile_idx=%d (semaphore_val=%d, semaphore_before=%d, semaphore_ptr_diff=%ld)\n",
+                printf("[FETCH] SM=%d (group=%s), old_tile_idx=%d -> new_tile_idx=%d\n",
                     int(blockIdx.x),
                     is_prefill_sm_group ? "prefill" : "decode",
-                    old_tile_idx,
-                    current_work.tile_idx,
-                    current_work.tile_idx - num_sm_for_group,
-                    semaphore_val_before,
-                    (long)(semaphore - params.tile_count_semaphore));
+                    old_tile_idx, current_work.tile_idx);
             }
         }
     }
@@ -850,6 +881,46 @@ public:
             int new_tile_idx = __shfl_sync(0xffffffff, current_work.tile_idx, 0 /*lane*/);
             WorkTileInfo work_info = {__shfl_sync(0xffffffff, current_work.tile_idx, 1 /*lane*/), current_work.block, current_work.bidh, current_work.bidb};
             work_info = tile_idx_to_work_tile(params, new_tile_idx, work_info);
+            
+            // Ni: Check if the new work is valid. If not, switch groups and try again
+            if (!work_info.is_valid(params) && params.prefill_sm_percentage != 0.0f) {
+                // The tile from current group is invalid, switch to the other group
+                bool is_prefill_sm_group = is_prefill_sm(params);
+                bool new_group = !is_prefill_sm_group;
+                int old_tile_idx = new_tile_idx;  // Save the old tile_idx for debug
+                set_sm_group(params, new_group);
+                __syncwarp();  // Ensure all threads see the updated sm_group
+                
+                // Fetch from the other group's semaphore
+                int* other_semaphore = new_group ? params.prefill_tile_count_semaphore : params.decode_tile_count_semaphore;
+                int num_sm_for_other_group = new_group
+                    ? int(params.num_sm * params.prefill_sm_percentage + 0.5f)
+                    : (params.num_sm - int(params.num_sm * params.prefill_sm_percentage + 0.5f));
+                
+                if (other_semaphore != nullptr && threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
+                    new_tile_idx = atomicAdd(other_semaphore, 1) + num_sm_for_other_group;
+                    if (params.tile_scheduler_debug) {
+                        printf("[SWITCH] SM=%d (group=%s->%s), old_tile_idx=%d -> new_tile_idx=%d\n",
+                            int(blockIdx.x),
+                            is_prefill_sm_group ? "prefill" : "decode",
+                            new_group ? "prefill" : "decode",
+                            old_tile_idx, new_tile_idx);
+                    }
+                }
+                // Broadcast the new tile_idx to all threads in the warp
+                new_tile_idx = __shfl_sync(0xffffffff, new_tile_idx, 0);
+                
+                // Initialize work_info for the new group, starting from the beginning of its tile index space
+                // This ensures tile_idx_to_work_tile() calculates group_end_tile correctly for the new group
+                work_info.tile_idx = 0;  // Start from beginning of new group's tile space for calculation
+                work_info.block = 0;
+                work_info.bidh = 0;
+                work_info.bidb = new_group ? 0 : params.num_prefill_batches;
+                
+                // Convert the new tile_idx to WorkTileInfo using fresh context
+                work_info = tile_idx_to_work_tile(params, new_tile_idx, work_info);
+            }
+            
             flash::named_barrier_sync(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0 /*id*/);  // TileCountSmemEmpty
             if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
                 *work_info_smem = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);

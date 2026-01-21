@@ -130,7 +130,7 @@ class cmake_build_ext(build_ext):
             num_jobs = max(1, num_jobs // nvcc_threads)
             # Cap CUDA compilation jobs to avoid OOM errors
             # CUDA compilation is memory-intensive, so limit to 32 jobs max
-            CUDA_MAX_JOBS = 32
+            CUDA_MAX_JOBS = 128
             if num_jobs > CUDA_MAX_JOBS:
                 logger.info(
                     "Capping CUDA compilation jobs from %d to %d to avoid OOM.",

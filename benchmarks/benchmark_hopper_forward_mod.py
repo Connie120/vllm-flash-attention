@@ -22,9 +22,9 @@ if parent_dir in sys.path:
 
 # Try to import from vLLM installation (where the extension is built)
 vllm_venv_paths = [
-    # os.path.expanduser("~/vllm-12-0-venv/lib/python3.12/site-packages/vllm_flash_attn-2.7.2.post1+cu128-py3.12-linux-x86_64.egg/vllm_flash_attn"),
+    os.path.expanduser("~/vllm-12-0-venv/lib/python3.12/site-packages/vllm_flash_attn-2.7.2.post1+cu128-py3.12-linux-x86_64.egg/vllm_flash_attn"),
     # os.path.expanduser("~/vllm-12-0-venv/lib/python3.12/site-packages/vllm/"),
-    os.path.expanduser("~/gpu-app-collection/bin/12.9/release/vllm/vllm-env/lib/python3.12/site-packages/vllm/"),
+    # os.path.expanduser("~/gpu-app-collection/bin/12.9/release/vllm/vllm-env/lib/python3.12/site-packages/vllm/"),
 ]
 
 fa3_imported = False
@@ -926,8 +926,8 @@ def main():
             causal=causal_combined,
             window_size=(-1, -1),
             num_splits=1,  # Always set to 1 to match flash_attn_varlen_func
-            # prefill_sm_percentage=args.prefill_sm_percentage, # TODO: need to add this back when running modified FA
-            # num_prefill_batches=batch_prefill, # TODO: need to add this back when running modified FA
+            prefill_sm_percentage=args.prefill_sm_percentage, # TODO: need to add this back when running modified FA
+            num_prefill_batches=batch_prefill, # TODO: need to add this back when running modified FA
         )
         sys.stdout.flush()  # Flush after get_scheduler_metadata to show its output
         sys.stderr.flush()
@@ -1113,9 +1113,9 @@ def main():
             'scheduler_metadata': scheduler_metadata,
             'fa_version': fa_version,
             'num_splits': 1,  # Always set to 1
-            # 'prefill_sm_percentage': args.prefill_sm_percentage,
-            # 'num_prefill_batches': batch_prefill,
-            # 'tile_scheduler_debug': args.tile_scheduler_debug,
+            'prefill_sm_percentage': args.prefill_sm_percentage,
+            'num_prefill_batches': batch_prefill,
+            'tile_scheduler_debug': args.tile_scheduler_debug,
             'repeats': repeats,
             'verbose': True  # Set to True to see Timer output showing all repeats
         }

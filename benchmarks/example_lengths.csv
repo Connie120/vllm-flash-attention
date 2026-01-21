@@ -1,0 +1,18 @@
+# Example sequence lengths file (CSV format)
+# Format: seqlen_q,seqlen_k
+# Lines starting with # are comments
+
+seqlen_q,seqlen_k
+1024,1024
+512,512
+2048,2048
+768,768
+1536,1536
+256,256
+1280,1280
+1024,1024
+
+
+
+
+

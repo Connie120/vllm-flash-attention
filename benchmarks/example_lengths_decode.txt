@@ -1,0 +1,17 @@
+# Example sequence lengths file for decode mode
+# Format: one length per line (seqlen_k for decode, seqlen_q will be 1)
+# Lines starting with # are comments
+
+1024
+512
+2048
+768
+1536
+256
+1280
+1024
+
+
+
+
+

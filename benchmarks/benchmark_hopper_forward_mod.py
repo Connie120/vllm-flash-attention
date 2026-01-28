@@ -22,7 +22,7 @@ if parent_dir in sys.path:
 
 # Try to import from vLLM installation (where the extension is built)
 vllm_venv_paths = [
-    os.path.expanduser("~/vllm-12-0-venv/lib/python3.12/site-packages/vllm_flash_attn-2.7.2.post1+cu128-py3.12-linux-x86_64.egg/vllm_flash_attn"),
+    os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
     # os.path.expanduser("~/vllm-12-0-venv/lib/python3.12/site-packages/vllm/"),
     # os.path.expanduser("~/gpu-app-collection/bin/12.9/release/vllm/vllm-env/lib/python3.12/site-packages/vllm/"),
 ]

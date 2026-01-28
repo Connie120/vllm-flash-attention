@@ -308,7 +308,9 @@ def main():
                         help='Number of KV heads for GQA (if not set, equals nheads-q; '
                              'must divide nheads-q)')
     parser.add_argument('--batch-prefill', type=int, default=0, help='Batch size for prefill')
-    parser.add_argument('--seqlen-prefill', type=int, default=1024, help='Sequence length for prefill')
+    parser.add_argument('--seqlen-prefill', type=int, default=1024, help='Sequence length for prefill (used for both Q and KV if --seqlen-q-prefill and --seqlen-k-prefill not specified)')
+    parser.add_argument('--seqlen-q-prefill', type=int, default=None, help='Query sequence length for prefill (if not set, uses --seqlen-prefill)')
+    parser.add_argument('--seqlen-k-prefill', type=int, default=None, help='Key/Value sequence length for prefill (if not set, uses --seqlen-prefill)')
     parser.add_argument('--batch-decode', type=int, default=0, help='Batch size for decode')
     parser.add_argument('--seqlen-q-decode', type=int, default=1, help='Query sequence length for decode')
     parser.add_argument('--seqlen-k-decode', type=int, default=1024, help='Key sequence length (context) for decode')
@@ -385,7 +387,9 @@ def main():
     # ========== Combined Prefill + Decode in single batch ==========
     print("\n### Combined Prefill + Decode Batch ###")
     batch_prefill = args.batch_prefill
-    seqlen_prefill = args.seqlen_prefill
+    # Use separate Q and K lengths for prefill if provided, otherwise use seqlen_prefill for both
+    seqlen_q_prefill = args.seqlen_q_prefill if args.seqlen_q_prefill is not None else args.seqlen_prefill
+    seqlen_k_prefill = args.seqlen_k_prefill if args.seqlen_k_prefill is not None else args.seqlen_prefill
     batch_decode = args.batch_decode
     seqlen_q_decode = args.seqlen_q_decode
     seqlen_k_decode = args.seqlen_k_decode
@@ -394,12 +398,12 @@ def main():
     # Handle different cases: pure decode, pure prefill, or mixed
     if batch_prefill > 0 and batch_decode > 0:
         # Mixed batch: take max of both
-        max_seqlen_q_combined_estimate = max(seqlen_prefill, seqlen_q_decode)
-        max_seqlen_k_combined_estimate = max(seqlen_prefill, seqlen_k_decode)
+        max_seqlen_q_combined_estimate = max(seqlen_q_prefill, seqlen_q_decode)
+        max_seqlen_k_combined_estimate = max(seqlen_k_prefill, seqlen_k_decode)
     elif batch_prefill > 0:
         # Pure prefill batch
-        max_seqlen_q_combined_estimate = seqlen_prefill
-        max_seqlen_k_combined_estimate = seqlen_prefill
+        max_seqlen_q_combined_estimate = seqlen_q_prefill
+        max_seqlen_k_combined_estimate = seqlen_k_prefill
     elif batch_decode > 0:
         # Pure decode batch
         max_seqlen_q_combined_estimate = seqlen_q_decode
@@ -419,13 +423,13 @@ def main():
     if batch_prefill > 0 and batch_decode > 0:
         # Mixed batch
         print(f"  - Mixed batch (prefill + decode):")
-        print(f"    Prefill: max_seqlen_q={seqlen_prefill} * {qhead_per_khead} = {seqlen_prefill * qhead_per_khead} {'<= 64 ✓' if seqlen_prefill * qhead_per_khead <= 64 else '> 64 ✗'}")
+        print(f"    Prefill: max_seqlen_q={seqlen_q_prefill} * {qhead_per_khead} = {seqlen_q_prefill * qhead_per_khead} {'<= 64 ✓' if seqlen_q_prefill * qhead_per_khead <= 64 else '> 64 ✗'}")
         print(f"    Decode: max_seqlen_q={seqlen_q_decode} * {qhead_per_khead} = {seqlen_q_decode * qhead_per_khead} {'<= 64 ✓' if seqlen_q_decode * qhead_per_khead <= 64 else '> 64 ✗'}")
         print(f"    Combined max: {max_seqlen_q_combined_estimate} * {qhead_per_khead} = {max_seqlen_q_combined_estimate * qhead_per_khead} {'<= 64 ✓' if max_seqlen_q_combined_estimate * qhead_per_khead <= 64 else '> 64 ✗'}")
     elif batch_prefill > 0:
         # Pure prefill batch
         print(f"  - Pure prefill batch:")
-        print(f"    max_seqlen_q={seqlen_prefill} * {qhead_per_khead} = {seqlen_prefill * qhead_per_khead} {'<= 64 ✓' if seqlen_prefill * qhead_per_khead <= 64 else '> 64 ✗'}")
+        print(f"    max_seqlen_q={seqlen_q_prefill} * {qhead_per_khead} = {seqlen_q_prefill * qhead_per_khead} {'<= 64 ✓' if seqlen_q_prefill * qhead_per_khead <= 64 else '> 64 ✗'}")
     elif batch_decode > 0:
         # Pure decode batch
         print(f"  - Pure decode batch:")
@@ -462,7 +466,7 @@ def main():
         print(f"  To enable: reduce max_seqlen_q to <= {64 // qhead_per_khead} or increase nheads_kv")
     
     # Create QKV tensors (handle empty batches)
-    total_q_prefill = batch_prefill * seqlen_prefill if batch_prefill > 0 else 0
+    total_q_prefill = batch_prefill * seqlen_q_prefill if batch_prefill > 0 else 0
     total_q_decode = batch_decode * seqlen_q_decode if batch_decode > 0 else 0
     
     # Always use paged KV format for both prefill and decode
@@ -486,7 +490,8 @@ def main():
     num_blocks_total_prefill = 0  # Initialize for use in decode block_table calculation
     num_blocks_allocated_prefill = 0  # Initialize for scattered allocation
     if batch_prefill > 0:
-        max_num_blocks_per_seq_prefill = math.ceil(seqlen_prefill / page_size)
+        # Use seqlen_k_prefill for KV cache block calculation
+        max_num_blocks_per_seq_prefill = math.ceil(seqlen_k_prefill / page_size)
         # Allocate exactly the number of blocks needed
         num_blocks_total_prefill = max_num_blocks_per_seq_prefill * batch_prefill
         num_blocks_allocated_prefill = num_blocks_total_prefill
@@ -494,8 +499,10 @@ def main():
         # Generate random data on CPU then move to GPU (faster than GPU random generation)
         kv_cache_prefill = torch.randn(2, num_blocks_allocated_prefill, page_size, nheads_kv, headdim, dtype=dtype).to(device)
         # New K/V tokens for prefill: [num_tokens, num_kv_heads, head_size]
-        k_prefill_new = torch.randn(total_q_prefill, nheads_kv, headdim, dtype=dtype).to(device)
-        v_prefill_new = torch.randn(total_q_prefill, nheads_kv, headdim_v, dtype=dtype).to(device)
+        # Use seqlen_k_prefill for KV tokens (not seqlen_q_prefill)
+        total_kv_prefill = batch_prefill * seqlen_k_prefill if batch_prefill > 0 else 0
+        k_prefill_new = torch.randn(total_kv_prefill, nheads_kv, headdim, dtype=dtype).to(device)
+        v_prefill_new = torch.randn(total_kv_prefill, nheads_kv, headdim_v, dtype=dtype).to(device)
         # Create block_table for prefill: (batch_prefill, max_num_blocks_per_seq_prefill)
         # Simulate scattered memory access by using non-sequential block indices
         # This makes the benchmark more realistic since in real vLLM scenarios, blocks
@@ -507,7 +514,7 @@ def main():
             # Sequential (contiguous) block allocation
             block_idx = 0
             for b in range(batch_prefill):
-                num_blocks_needed = math.ceil(seqlen_prefill / page_size)
+                num_blocks_needed = math.ceil(seqlen_k_prefill / page_size)
                 block_table_prefill[b, :num_blocks_needed] = torch.arange(
                     block_idx, block_idx + num_blocks_needed, dtype=torch.int32, device=device
                 )
@@ -519,7 +526,7 @@ def main():
             max_valid_idx = num_blocks_allocated_prefill - 1
             
             for b in range(batch_prefill):
-                num_blocks_needed = math.ceil(seqlen_prefill / page_size)
+                num_blocks_needed = math.ceil(seqlen_k_prefill / page_size)
                 # Generate scattered block indices instead of sequential
                 # Pattern: scatter blocks with varying offsets relative to sequence start
                 # Each sequence gets a starting block index, then scatters within its range
@@ -769,16 +776,16 @@ def main():
     # For paged KV, we don't use cu_seqlens_k, but we still need cu_seqlens_q
     if batch_prefill > 0 and batch_decode > 0:
         # Mixed batch: combine prefill and decode
-        cu_seqlens_q_prefill = torch.arange(0, (batch_prefill + 1) * seqlen_prefill, 
-                                           step=seqlen_prefill, dtype=torch.int32, device=device)
+        cu_seqlens_q_prefill = torch.arange(0, (batch_prefill + 1) * seqlen_q_prefill, 
+                                           step=seqlen_q_prefill, dtype=torch.int32, device=device)
         cu_seqlens_q_decode = torch.arange(0, (batch_decode + 1) * seqlen_q_decode,
                                           step=seqlen_q_decode, dtype=torch.int32, device=device)
         cu_seqlens_q_decode = cu_seqlens_q_decode + total_q_prefill
         cu_seqlens_q_combined = torch.cat([cu_seqlens_q_prefill, cu_seqlens_q_decode[1:]], dim=0)
     elif batch_prefill > 0:
         # Pure prefill batch
-        cu_seqlens_q_combined = torch.arange(0, (batch_prefill + 1) * seqlen_prefill, 
-                                           step=seqlen_prefill, dtype=torch.int32, device=device)
+        cu_seqlens_q_combined = torch.arange(0, (batch_prefill + 1) * seqlen_q_prefill, 
+                                           step=seqlen_q_prefill, dtype=torch.int32, device=device)
     elif batch_decode > 0:
         # Pure decode batch
         cu_seqlens_q_combined = torch.arange(0, (batch_decode + 1) * seqlen_q_decode,
@@ -796,7 +803,7 @@ def main():
     if batch_prefill > 0 and batch_decode > 0:
         # Mixed batch: combine prefill and decode
         seqused_k = torch.cat([
-            torch.full((batch_prefill,), seqlen_prefill, dtype=torch.int32, device=device),
+            torch.full((batch_prefill,), seqlen_k_prefill, dtype=torch.int32, device=device),
             torch.full((batch_decode,), seqlen_k_decode, dtype=torch.int32, device=device)
         ])
         # Create combined block_table with max blocks across both prefill and decode
@@ -812,7 +819,7 @@ def main():
             block_table_combined[batch_prefill:, :max_num_blocks_per_seq_decode_with_new_token] = block_table_decode_offset
     elif batch_prefill > 0:
         # Pure prefill batch with paged KV
-        seqused_k = torch.full((total_batch,), seqlen_prefill, dtype=torch.int32, device=device)
+        seqused_k = torch.full((total_batch,), seqlen_k_prefill, dtype=torch.int32, device=device)
         block_table_combined = block_table_prefill
     elif batch_decode > 0:
         # Pure decode batch with paged KV
@@ -848,7 +855,7 @@ def main():
     # (see vllm/v1/worker/gpu_model_runner.py line 1055: causal=True)
     causal_combined = True
     print(f"Combined batch: {total_batch} sequences total")
-    print(f"  - Prefill: {batch_prefill} sequences, {seqlen_prefill} tokens each")
+    print(f"  - Prefill: {batch_prefill} sequences, {seqlen_q_prefill} query tokens, {seqlen_k_prefill} KV tokens each")
     print(f"  - Decode: {batch_decode} sequences, {seqlen_q_decode} query tokens, {seqlen_k_decode} context tokens each")
     print(f"Q shape: {q_combined.shape} (vLLM format: [num_tokens, num_heads, head_size])")
     print(f"KV cache shape: {kv_cache_combined.shape} (vLLM format: [2, num_blocks, block_size, num_kv_heads, head_size])")
@@ -892,7 +899,7 @@ def main():
     
     # Calculate combined FLOPS (for summary even if benchmark fails)
     # FLOPs scale with number of query heads; for GQA we still use nheads-q here
-    flops_prefill = flops(batch_prefill, seqlen_prefill, seqlen_prefill, headdim, nheads_q, causal_combined, mode="fwd")
+    flops_prefill = flops(batch_prefill, seqlen_q_prefill, seqlen_k_prefill, headdim, nheads_q, causal_combined, mode="fwd")
     flops_decode = flops(batch_decode, seqlen_q_decode, seqlen_k_decode, headdim, nheads_q, causal_combined, mode="fwd")
     total_flops = flops_prefill + flops_decode
     

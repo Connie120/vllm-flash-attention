@@ -15,12 +15,28 @@ import torch
 import torch.utils.benchmark as benchmark
 
 # Remove local flash-attention directory from path to avoid circular import
-# We want to import from vLLM installation, not the local source
+# We want to import from vLLM installation or build directory, not the local source
 parent_dir = str(Path(__file__).parent.parent)
 if parent_dir in sys.path:
     sys.path.remove(parent_dir)
 
-# Try to import from vLLM installation (where the extension is built)
+# Build list of potential import paths in priority order:
+# 1. Current Python environment (site-packages if installed via pip)
+# 2. Local build directory (if built from source)
+# 3. Hardcoded venv paths (fallback)
+import_paths = []
+
+# 1. Try current Python environment first (includes site-packages if installed)
+# This will work if vllm_flash_attn is installed in the current Python environment
+import_paths.append(None)  # None means try direct import without modifying sys.path
+
+# 2. Try local build directory (if built from source)
+build_dir = os.path.join(parent_dir, "build", f"lib.linux-x86_64-cpython-{sys.version_info.major}{sys.version_info.minor}")
+if os.path.exists(build_dir):
+    import_paths.append(build_dir)
+    print(f"Found local build directory: {build_dir}")
+
+# 3. Hardcoded venv paths (fallback)
 vllm_venv_paths = [
     # os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
     os.path.expanduser("~/vllm-10-2-orig-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
@@ -28,75 +44,91 @@ vllm_venv_paths = [
     # os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm/"),
 ]
 
-fa3_imported = False
 for vllm_path in vllm_venv_paths:
     expanded_path = os.path.expanduser(vllm_path) if vllm_path.startswith("~") else vllm_path
     if os.path.exists(expanded_path):
-        # Insert at the beginning to prioritize vLLM installation
-        if expanded_path not in sys.path:
-            sys.path.insert(0, expanded_path)
-        try:
+        import_paths.append(expanded_path)
+
+fa3_imported = False
+import_source = None
+
+for import_path in import_paths:
+    try:
+        # If import_path is None, try direct import (from current Python environment)
+        if import_path is None:
+            print("Trying to import from current Python environment...")
             # Remove any cached modules to force fresh import
             if 'vllm_flash_attn' in sys.modules:
                 del sys.modules['vllm_flash_attn']
             if 'vllm_flash_attn.flash_attn_interface' in sys.modules:
                 del sys.modules['vllm_flash_attn.flash_attn_interface']
-            
-            from vllm_flash_attn.flash_attn_interface import (
-                flash_attn_varlen_func,
-                get_scheduler_metadata,
-                FA3_AVAILABLE,
-                FA3_UNAVAILABLE_REASON,
-                is_fa_version_supported,
-                fa_version_unsupported_reason,
-            )
-            # Import reshape_and_cache_flash to simulate vLLM's cache write
-            reshape_and_cache_flash_available = False
-            reshape_and_cache_flash_func = None
+        else:
+            # Add path to sys.path if not already there
+            if import_path not in sys.path:
+                sys.path.insert(0, import_path)
+            print(f"Trying to import from: {import_path}")
+            # Remove any cached modules to force fresh import
+            if 'vllm_flash_attn' in sys.modules:
+                del sys.modules['vllm_flash_attn']
+            if 'vllm_flash_attn.flash_attn_interface' in sys.modules:
+                del sys.modules['vllm_flash_attn.flash_attn_interface']
+        
+        from vllm_flash_attn.flash_attn_interface import (
+            flash_attn_varlen_func,
+            get_scheduler_metadata,
+            FA3_AVAILABLE,
+            FA3_UNAVAILABLE_REASON,
+            is_fa_version_supported,
+            fa_version_unsupported_reason,
+        )
+        # Import reshape_and_cache_flash to simulate vLLM's cache write
+        reshape_and_cache_flash_available = False
+        reshape_and_cache_flash_func = None
+        try:
+            from vllm import _custom_ops as ops
+            if hasattr(ops, 'reshape_and_cache_flash'):
+                reshape_and_cache_flash_func = ops.reshape_and_cache_flash
+                reshape_and_cache_flash_available = True
+                print(f"Found reshape_and_cache_flash in vllm._custom_ops")
+        except ImportError:
+            pass
+        
+        if not reshape_and_cache_flash_available:
             try:
-                from vllm import _custom_ops as ops
-                if hasattr(ops, 'reshape_and_cache_flash'):
-                    reshape_and_cache_flash_func = ops.reshape_and_cache_flash
-                    reshape_and_cache_flash_available = True
-                    print(f"Found reshape_and_cache_flash in vllm._custom_ops")
+                from vllm.attention.utils.fa_utils import reshape_and_cache_flash
+                reshape_and_cache_flash_func = reshape_and_cache_flash
+                reshape_and_cache_flash_available = True
+                print(f"Found reshape_and_cache_flash in vllm.attention.utils.fa_utils")
             except ImportError:
-                pass
-            
-            if not reshape_and_cache_flash_available:
-                try:
-                    from vllm.attention.utils.fa_utils import reshape_and_cache_flash
-                    reshape_and_cache_flash_func = reshape_and_cache_flash
-                    reshape_and_cache_flash_available = True
-                    print(f"Found reshape_and_cache_flash in vllm.attention.utils.fa_utils")
-                except ImportError:
-                    print("Warning: reshape_and_cache_flash not available - cannot simulate vLLM cache write")
-            fa3_imported = True
-            print(f"Successfully imported FA3 from: {expanded_path}")
-            break
-        except ImportError as e:
-            print(f"Failed to import from {expanded_path}: {e}")
-            continue
+                print("Warning: reshape_and_cache_flash not available - cannot simulate vLLM cache write")
+        fa3_imported = True
+        import_source = import_path if import_path is not None else "current Python environment"
+        print(f"Successfully imported FA3 from: {import_source}")
+        break
+    except ImportError as e:
+        if import_path is None:
+            print(f"Failed to import from current Python environment: {e}")
+        else:
+            print(f"Failed to import from {import_path}: {e}")
+        continue
 
-# If not found in vLLM paths, raise error
+# If not found in any paths, raise error
 if not fa3_imported:
+    all_paths_tried = ["current Python environment"] + [p for p in import_paths[1:] if p is not None]
     raise ImportError(
         "FA3 CUDA extension (_vllm_fa3_C) could not be imported.\n"
-        "Tried paths:\n" + "\n".join(f"  {p}" for p in vllm_venv_paths) + "\n"
+        "Tried paths:\n" + "\n".join(f"  {p}" for p in all_paths_tried) + "\n"
         "Please ensure:\n"
-        "  1. The vLLM environment is activated\n"
-        "  2. The extension is built in one of the above paths\n"
-        "  3. The extension module _vllm_fa3_C.so exists"
+        "  1. vllm_flash_attn is installed in your Python environment (pip install -e .), OR\n"
+        "  2. The extension is built in the build directory, OR\n"
+        "  3. The vLLM environment is activated and the extension is in one of the venv paths\n"
+        "  4. The extension module _vllm_fa3_C.so exists"
     )
 
-# Verify FA3 is available and supported
+# Verify FA3 is available (but device capability check happens in main() after args parsing)
 if not FA3_AVAILABLE:
     raise ImportError(
         f"FA3 CUDA extension is not available: {FA3_UNAVAILABLE_REASON}"
-    )
-if not is_fa_version_supported(3):
-    reason = fa_version_unsupported_reason(3)
-    raise RuntimeError(
-        f"FA3 is not supported on this device. Reason: {reason}"
     )
 
 
@@ -324,14 +356,53 @@ def main():
                         help='Use contiguous (sequential) block allocation instead of scattered blocks')
     parser.add_argument('--flush-cache', action='store_true',
                         help='Thrash L2 cache before each benchmark run to ensure cold cache (avoids cache effects)')
-    parser.add_argument('--prefill-sm-percentage', type=float, default=0.0,
-                        help='Percentage of SMs dedicated to prefill (0.0-0.9). Default: 0.5 (50%% prefill, 50%% decode)')
     parser.add_argument('--no-warmup', action='store_true',
                         help='Skip warmup runs before timing (default: warmup is enabled)')
     parser.add_argument('--tile-scheduler-debug', action='store_true',
                         help='Enable printf debug output in tile scheduler (default: disabled)')
     
     args = parser.parse_args()
+    
+    # Verify FA3 device support (after args parsing so we can use --skip-device-check)
+    # This check calls torch.cuda.get_device_capability() which can hang when CUDA
+    # instrumentation tools like nvbit are active, so we allow skipping it
+    if not args.skip_device_check:
+        # Flush output before CUDA calls to ensure messages are visible
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
+        # Add a small delay to allow instrumentation tools to initialize
+        # This helps avoid hangs when nvbit or other CUDA instrumentation is active
+        import time
+        time.sleep(0.1)
+        
+        # Synchronize CUDA before checking device capability
+        # This ensures any pending CUDA operations complete before instrumentation
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception as e:
+                print(f"Warning: CUDA synchronization failed: {e}")
+                print("This may happen when using CUDA instrumentation tools like nvbit")
+                print("Consider using --skip-device-check flag")
+        
+        try:
+            if not is_fa_version_supported(3):
+                reason = fa_version_unsupported_reason(3)
+                raise RuntimeError(
+                    f"FA3 is not supported on this device. Reason: {reason}"
+                )
+        except RuntimeError as e:
+            # If device check fails, it might be due to instrumentation interference
+            error_msg = str(e)
+            if "CUDA" in error_msg.upper() or "device" in error_msg.lower():
+                print(f"Warning: Device capability check failed: {e}")
+                print("This may be due to CUDA instrumentation tools (e.g., nvbit) interfering with CUDA API calls")
+                print("If you're using nvbit or similar tools, use --skip-device-check to bypass this check")
+            raise
+    else:
+        print("Skipping device capability check (--skip-device-check flag set)")
+        print("Warning: This assumes FA3 is supported on the current device")
     
     # Parse dtype
     dtype_map = {'bfloat16': torch.bfloat16, 'float16': torch.float16}
@@ -381,7 +452,6 @@ def main():
     print(f"nheads-q: {nheads_q}, nheads-kv: {nheads_kv}")
     print(f"Page size: {args.page_size if args.page_size is not None else 'None (no paging)'}")
     print(f"Block allocation: {'Contiguous (sequential)' if args.contiguous_blocks else 'Scattered (non-sequential)'}")
-    print(f"Prefill SM percentage: {args.prefill_sm_percentage:.1%} ({args.prefill_sm_percentage*100:.0f}%% prefill, {(1-args.prefill_sm_percentage)*100:.0f}%% decode)")
     print("=" * 80)
     
     # ========== Combined Prefill + Decode in single batch ==========

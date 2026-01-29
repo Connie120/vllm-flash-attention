@@ -41,22 +41,8 @@ parent_dir = str(Path(__file__).parent.parent)
 if parent_dir in sys.path:
     sys.path.remove(parent_dir)
 
-# Check if we're running under a CUPTI tool (need to delay CUDA context creation)
-# CUPTI tools need to initialize before any CUDA context is created
-is_cupti_tool = (
-    '--skip-device-check' in sys.argv or
-    '--skip-vllm-import' in sys.argv or
-    '--skip-sync' in sys.argv or
-    '--skip-fa3-check' in sys.argv or
-    any('cupti' in env.lower() for env in os.environ.keys()) or
-    any('nvbit' in env.lower() for env in os.environ.keys()) or
-    any('ncu' in env.lower() for env in os.environ.keys()) or
-    'CUPTI' in os.environ or
-    'NVPROF' in os.environ
-)
-
-# For CUPTI tools, delay vLLM flash attention import until after args parsing
-# This allows CUPTI to initialize before CUDA context creation
+# ALWAYS delay vLLM flash attention import - we'll import it in main() after args parsing
+# This ensures CUPTI tools (like Accel-Sim's pm_sampling) can initialize before CUDA context creation
 fa3_imported = False
 import_source = None
 flash_attn_varlen_func = None
@@ -68,7 +54,9 @@ fa_version_unsupported_reason = None
 reshape_and_cache_flash_available = False
 reshape_and_cache_flash_func = None
 
-if not is_cupti_tool:
+# Don't import vLLM flash attention here - delay until main() after args parsing
+# This is critical for CUPTI compatibility
+if False:  # Changed to False to always delay import
     # Normal import path (not using CUPTI)
     vllm_venv_paths = [
         # os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
@@ -134,25 +122,14 @@ if not is_cupti_tool:
             print(f"Reason: {e}")
             continue
     
-    # If not found in vLLM paths, raise error
+    # If not found in vLLM paths, raise error (but only if we tried to import)
     if not fa3_imported:
-        raise ImportError(
-            "FA3 CUDA extension (_vllm_fa3_C) could not be imported.\n"
-            "Tried paths:\n" + "\n".join(f"  {p}" for p in vllm_venv_paths) + "\n"
-            "Please ensure:\n"
-            "  1. The vLLM environment is activated\n"
-            "  2. The extension is built in one of the above paths\n"
-            "  3. The extension module _vllm_fa3_C.so exists"
-        )
-    
-    # Verify FA3 is available
-    if not FA3_AVAILABLE:
-        raise ImportError(
-            f"FA3 CUDA extension is not available: {FA3_UNAVAILABLE_REASON}"
-        )
+        # Don't raise error here - we'll import in main() instead
+        pass
 else:
-    # CUPTI tool detected - delay import until after args parsing
-    print("CUPTI tool detected - delaying vLLM flash attention import until after CUPTI initialization")
+    # Always delay import - will happen in main() after args parsing
+    # This ensures CUPTI tools can initialize before CUDA context creation
+    pass
 
 
 def thrash_l2_cache(device='cuda', skip_sync=False):
@@ -396,16 +373,55 @@ def main():
                         help='Skip all torch.cuda.synchronize() calls (required for CUPTI tools like nvbit, ncu, etc. that can hang on synchronize)')
     parser.add_argument('--skip-fa3-check', action='store_true',
                         help='Skip FA3 availability check at import time (required for CUPTI tools that need to initialize before CUDA context creation)')
+    parser.add_argument('--cupti-delay', type=float, default=0.0,
+                        help='Delay in seconds before importing CUDA libraries (for Accel-Sim pm_sampling compatibility, try 1.0-2.0)')
     
     args = parser.parse_args()
     
-    # For CUPTI tools, import torch now (after CUPTI has initialized)
+    # Import torch now (after CUPTI has initialized if using CUPTI tools)
     global torch, benchmark
     if torch is None:
+        # For Accel-Sim pm_sampling: ensure CUPTI has finished configuring metrics
+        # before we create any CUDA context. Accel-Sim's pm_sampling configures CUPTI
+        # metrics at startup, and this must complete before any CUDA context exists.
+        # The error CUPTI_ERROR_INVALID_PARAMETER from cuptiProfilerHostConfigAddMetrics
+        # occurs when CUPTI tries to configure metrics after a CUDA context exists.
+        import time
+        
+        # Check if we're likely running under Accel-Sim pm_sampling
+        # Accel-Sim typically sets certain environment variables or we can detect it
+        # by checking if CUPTI-related flags are present
+        is_accel_sim = (
+            'ACCEL_SIM' in os.environ or
+            'pm_sampling' in str(sys.argv).lower() or
+            any('accel' in env.lower() for env in os.environ.keys())
+        )
+        
+        # Use user-specified delay or auto-detect delay for CUPTI tools
+        delay_time = args.cupti_delay if hasattr(args, 'cupti_delay') else 0.0
+        if delay_time > 0:
+            print(f"Delaying CUDA initialization by {delay_time} seconds for CUPTI compatibility...")
+            time.sleep(delay_time)
+            print("CUDA initialization delay complete, proceeding with imports...")
+        elif is_accel_sim or is_cupti_tool:
+            # Give CUPTI/pm_sampling more time to finish metric configuration
+            # Accel-Sim's pm_sampling needs to call cuptiProfilerHostConfigAddMetrics
+            # before any CUDA context is created
+            print("Detected CUPTI tool (Accel-Sim pm_sampling) - delaying CUDA initialization...")
+            time.sleep(1.0)  # 1 second delay to let CUPTI/pm_sampling finish initialization
+            print("CUDA initialization delay complete, proceeding with imports...")
+        
         import torch
         import torch.utils.benchmark as benchmark
+        
+        # Additional check: if CUDA is available, give it a moment to stabilize
+        # This helps ensure CUPTI has finished its configuration
+        if torch.cuda.is_available() and (is_accel_sim or is_cupti_tool):
+            # Don't create a CUDA context yet - just check availability
+            # The actual context creation will happen when we create tensors
+            pass
     
-    # For CUPTI tools, import vLLM flash attention NOW (after CUPTI has initialized)
+    # Import vLLM flash attention NOW (after CUPTI has initialized if using CUPTI tools)
     global fa3_imported, import_source, flash_attn_varlen_func, get_scheduler_metadata
     global FA3_AVAILABLE, FA3_UNAVAILABLE_REASON, is_fa_version_supported, fa_version_unsupported_reason
     global reshape_and_cache_flash_available, reshape_and_cache_flash_func

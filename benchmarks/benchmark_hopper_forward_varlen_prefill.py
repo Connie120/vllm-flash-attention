@@ -413,6 +413,20 @@ def main():
             any('accel' in env.lower() for env in os.environ.keys())
         )
         
+        # Check if we're running under a CUPTI tool (for informational purposes)
+        is_cupti_tool = (
+            args.skip_device_check or
+            args.skip_vllm_import or
+            args.skip_sync or
+            args.skip_fa3_check or
+            args.cupti_delay > 0 or
+            any('cupti' in env.lower() for env in os.environ.keys()) or
+            any('nvbit' in env.lower() for env in os.environ.keys()) or
+            any('ncu' in env.lower() for env in os.environ.keys()) or
+            'CUPTI' in os.environ or
+            'NVPROF' in os.environ
+        )
+        
         # Use user-specified delay or auto-detect delay for CUPTI tools
         delay_time = args.cupti_delay if hasattr(args, 'cupti_delay') else 0.0
         if delay_time > 0:

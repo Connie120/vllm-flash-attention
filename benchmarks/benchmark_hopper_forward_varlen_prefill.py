@@ -87,7 +87,7 @@ for vllm_path in vllm_venv_paths:
         fa3_imported = True
         import_source = expanded_path
         break
-    except ImportError:
+    except ImportError as e:
         print(f"Failed to import FA3 from {expanded_path}")
         print(f"Reason: {e}")
         continue
@@ -110,7 +110,7 @@ if not FA3_AVAILABLE:
     )
 
 
-def thrash_l2_cache(device='cuda'):
+def thrash_l2_cache(device='cuda', skip_sync=False):
     """Thrash the GPU L2 cache by allocating and accessing large amounts of memory.
     
     This function allocates tensors large enough to fill the L2 cache multiple times
@@ -119,6 +119,7 @@ def thrash_l2_cache(device='cuda'):
     
     Args:
         device: The CUDA device to use (default: 'cuda')
+        skip_sync: If True, skip torch.cuda.synchronize() call (for CUPTI compatibility)
     
     Note:
         - Hopper GPUs (H100) have ~50MB L2 cache
@@ -152,14 +153,15 @@ def thrash_l2_cache(device='cuda'):
         # Write operation with different pattern
         tensor.fill_(1)
     
-    # Synchronize to ensure all operations complete
-    torch.cuda.synchronize()
+    # Synchronize to ensure all operations complete (skip if CUPTI is active)
+    if not skip_sync:
+        torch.cuda.synchronize()
     
     # Clean up (tensors will be garbage collected)
     del flush_tensors
 
 
-def benchmark_forward(fn, *inputs, repeats=10, desc="", verbose=True, flush_cache=False, warmup=True, **kwinputs):
+def benchmark_forward(fn, *inputs, repeats=10, desc="", verbose=True, flush_cache=False, warmup=True, skip_sync=False, **kwinputs):
     """Use Pytorch Benchmark on the forward pass of an arbitrary function.
     
     Args:
@@ -170,6 +172,7 @@ def benchmark_forward(fn, *inputs, repeats=10, desc="", verbose=True, flush_cach
         verbose: Whether to print timing information
         flush_cache: If True, thrash L2 cache before each run to ensure cold cache
         warmup: If True, perform warmup runs before timing (default: True)
+        skip_sync: If True, skip all torch.cuda.synchronize() calls (for CUPTI compatibility)
         **kwinputs: Keyword arguments for fn
     """
     if verbose:
@@ -180,14 +183,14 @@ def benchmark_forward(fn, *inputs, repeats=10, desc="", verbose=True, flush_cach
         # Do one warmup run (if enabled)
         if warmup:
             if flush_cache and torch.cuda.is_available():
-                thrash_l2_cache(device='cuda')
+                thrash_l2_cache(device='cuda', skip_sync=skip_sync)
             fn(*inputs, **kwinputs)
-            if torch.cuda.is_available():
+            if torch.cuda.is_available() and not skip_sync:
                 torch.cuda.synchronize()
         
         # Single timed run
         if flush_cache and torch.cuda.is_available():
-            thrash_l2_cache(device='cuda')
+            thrash_l2_cache(device='cuda', skip_sync=skip_sync)
         start_event = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
         end_event = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
         
@@ -201,7 +204,8 @@ def benchmark_forward(fn, *inputs, repeats=10, desc="", verbose=True, flush_cach
         
         if torch.cuda.is_available():
             end_event.record()
-            torch.cuda.synchronize()
+            if not skip_sync:
+                torch.cuda.synchronize()
             elapsed_time = start_event.elapsed_time(end_event) / 1000.0  # Convert ms to seconds
         else:
             elapsed_time = time_module.perf_counter() - start_time
@@ -225,16 +229,16 @@ def benchmark_forward(fn, *inputs, repeats=10, desc="", verbose=True, flush_cach
     num_warmup = 0
     for _ in range(num_warmup):
         if flush_cache and torch.cuda.is_available():
-            thrash_l2_cache(device='cuda')
+            thrash_l2_cache(device='cuda', skip_sync=skip_sync)
         fn(*inputs, **kwinputs)
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and not skip_sync:
         torch.cuda.synchronize()
     
     # Create a wrapper function that thrashes L2 cache before each call
     if flush_cache:
         def wrapped_fn(*args, **kwargs):
             if torch.cuda.is_available():
-                thrash_l2_cache(device='cuda')
+                thrash_l2_cache(device='cuda', skip_sync=skip_sync)
             return fn(*args, **kwargs)
         timer_fn = wrapped_fn
     else:
@@ -291,7 +295,7 @@ def efficiency(flop, time):
     return (flop / time / 10**12) if not math.isnan(time) and time > 0 else 0.0
 
 
-def time_forward(func, *args, flush_cache=False, warmup=True, **kwargs):
+def time_forward(func, *args, flush_cache=False, warmup=True, skip_sync=False, **kwargs):
     """Benchmark forward pass only.
     
     Args:
@@ -299,12 +303,13 @@ def time_forward(func, *args, flush_cache=False, warmup=True, **kwargs):
         *args: Positional arguments for func
         flush_cache: If True, thrash L2 cache before each run to ensure cold cache
         warmup: If True, perform warmup runs before timing (default: True)
+        skip_sync: If True, skip all torch.cuda.synchronize() calls (for CUPTI compatibility)
         **kwargs: Keyword arguments for func (repeats, verbose, etc.)
     
     Returns:
         Mean forward time in seconds
     """
-    time_f = benchmark_forward(func, *args, flush_cache=flush_cache, warmup=warmup, **kwargs)
+    time_f = benchmark_forward(func, *args, flush_cache=flush_cache, warmup=warmup, skip_sync=skip_sync, **kwargs)
     return time_f[1].mean
 
 
@@ -342,6 +347,8 @@ def main():
                         help='Skip device capability check (used when using nvbit or other CUDA instrumentation tools that may hang on CUDA API calls)')
     parser.add_argument('--skip-vllm-import', action='store_true',
                         help='Skip importing vllm._custom_ops (useful when using nvbit or other CUDA instrumentation tools that may hang during vllm import)')
+    parser.add_argument('--skip-sync', action='store_true',
+                        help='Skip all torch.cuda.synchronize() calls (required for CUPTI tools like nvbit, ncu, etc. that can hang on synchronize)')
     
     args = parser.parse_args()
     
@@ -349,8 +356,8 @@ def main():
     # This check calls torch.cuda.get_device_capability() which can hang when CUDA
     # instrumentation tools like nvbit are active, so we allow skipping it
     if not args.skip_device_check:
-        # Synchronize CUDA before checking device capability
-        if torch.cuda.is_available():
+        # Synchronize CUDA before checking device capability (skip if CUPTI is active)
+        if torch.cuda.is_available() and not args.skip_sync:
             try:
                 torch.cuda.synchronize()
             except Exception:
@@ -1090,7 +1097,8 @@ def main():
                     v_scale,
                 )
                 print(f"✓ reshape_and_cache_flash completed")
-                torch.cuda.synchronize()  # Ensure cache write completes before attention
+                if not args.skip_sync:
+                    torch.cuda.synchronize()  # Ensure cache write completes before attention
             else:
                 print("Error: reshape_and_cache_flash_func is None")
         except Exception as e:
@@ -1172,6 +1180,7 @@ def main():
             flash_attn_varlen_func,
             flush_cache=args.flush_cache,
             warmup=not args.no_warmup,
+            skip_sync=args.skip_sync,
             **func_kwargs
         )
         

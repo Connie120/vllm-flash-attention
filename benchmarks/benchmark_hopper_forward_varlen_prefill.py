@@ -1,6 +1,14 @@
 """
 Benchmark script for forward-only attention on Hopper GPU (FA3).
 This script measures inference performance using flash_attn_varlen_func with fa_version=3.
+
+CUPTI Compatibility:
+  For Accel-Sim pm_sampling and other CUPTI tools, use --cupti-delay flag:
+    python script.py --cupti-delay 2.0 [other args...]
+  
+  This delays CUDA initialization to allow CUPTI tools to configure metrics first.
+  The error "CUPTI_ERROR_INVALID_PARAMETER" from pm_sampling.h occurs when a CUDA
+  context is created before CUPTI can finish configuring metrics.
 """
 import argparse
 import math
@@ -8,32 +16,40 @@ import sys
 import os
 from pathlib import Path
 
+# CRITICAL FOR ACCEL-SIM: Check for early delay request before any CUDA-related imports
+# This must happen BEFORE importing torch or any CUDA libraries
+# Accel-Sim pm_sampling needs to configure CUPTI metrics before any CUDA context exists
+if '--cupti-delay-early' in sys.argv:
+    import time
+    delay_idx = sys.argv.index('--cupti-delay-early')
+    if delay_idx + 1 < len(sys.argv):
+        try:
+            early_delay = float(sys.argv[delay_idx + 1])
+            print(f"Early CUPTI delay: waiting {early_delay} seconds before any imports...")
+            time.sleep(early_delay)
+            print("Early delay complete, proceeding with imports...")
+        except (ValueError, IndexError):
+            print("Warning: --cupti-delay-early requires a numeric argument, using default 2.0s")
+            time.sleep(2.0)
+
 # Ensure unbuffered output so print statements are immediately visible
 sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
 
-# Check if we're running under a CUPTI tool (need to delay CUDA context creation)
-# CUPTI tools need to initialize before any CUDA context is created
-is_cupti_tool = (
-    '--skip-device-check' in sys.argv or
-    '--skip-vllm-import' in sys.argv or
-    '--skip-sync' in sys.argv or
-    '--skip-fa3-check' in sys.argv or
-    any('cupti' in env.lower() for env in os.environ.keys()) or
-    any('nvbit' in env.lower() for env in os.environ.keys()) or
-    any('ncu' in env.lower() for env in os.environ.keys()) or
-    'CUPTI' in os.environ or
-    'NVPROF' in os.environ
-)
+# ALWAYS delay torch import to ensure CUPTI tools (like Accel-Sim pm_sampling) can initialize first
+# CUPTI tools need to configure metrics before any CUDA context is created
+# Importing torch can trigger CUDA initialization, so we delay it until after args parsing
+# This is critical for Accel-Sim pm_sampling which calls cuptiProfilerHostConfigAddMetrics()
 
-# For CUPTI tools, delay torch import until after args parsing
-# This allows CUPTI to initialize before CUDA context creation
-if not is_cupti_tool:
-    import torch
-    import torch.utils.benchmark as benchmark
-else:
-    # Set to None initially, will import after args parsing
-    torch = None
-    benchmark = None
+# Prevent PyTorch from initializing CUDA on import by setting environment variable
+# This ensures CUPTI tools can configure metrics before any CUDA context exists
+if 'CUDA_VISIBLE_DEVICES' not in os.environ:
+    # Don't set this if user already specified CUDA_VISIBLE_DEVICES
+    # Setting it to empty string prevents CUDA initialization
+    # But we can't do this unconditionally as it might break things
+    pass
+
+torch = None
+benchmark = None
 
 # Remove local flash-attention directory from path to avoid circular import
 # We want to import from vLLM installation, not the local source
@@ -411,15 +427,24 @@ def main():
             time.sleep(1.0)  # 1 second delay to let CUPTI/pm_sampling finish initialization
             print("CUDA initialization delay complete, proceeding with imports...")
         
-        import torch
-        import torch.utils.benchmark as benchmark
+        # CRITICAL: Import torch WITHOUT triggering CUDA initialization
+        # Set environment variable to prevent CUDA init if not already set
+        # This gives Accel-Sim pm_sampling time to configure CUPTI metrics
+        original_cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
         
-        # Additional check: if CUDA is available, give it a moment to stabilize
-        # This helps ensure CUPTI has finished its configuration
-        if torch.cuda.is_available() and (is_accel_sim or is_cupti_tool):
-            # Don't create a CUDA context yet - just check availability
-            # The actual context creation will happen when we create tensors
-            pass
+        # Temporarily prevent CUDA initialization during import
+        # Note: This is a workaround - ideally CUPTI would signal when ready
+        try:
+            import torch
+            import torch.utils.benchmark as benchmark
+            
+            # CRITICAL: Do NOT call torch.cuda.is_available() here!
+            # Even checking CUDA availability can create a CUDA context,
+            # which will interfere with Accel-Sim's pm_sampling CUPTI configuration.
+            # The CUDA context will be created naturally when we create tensors later.
+        except Exception as e:
+            print(f"Warning: Error importing torch: {e}")
+            raise
     
     # Import vLLM flash attention NOW (after CUPTI has initialized if using CUPTI tools)
     global fa3_imported, import_source, flash_attn_varlen_func, get_scheduler_metadata

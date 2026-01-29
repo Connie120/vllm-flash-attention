@@ -11,8 +11,29 @@ from pathlib import Path
 # Ensure unbuffered output so print statements are immediately visible
 sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
 
-import torch
-import torch.utils.benchmark as benchmark
+# Check if we're running under a CUPTI tool (need to delay CUDA context creation)
+# CUPTI tools need to initialize before any CUDA context is created
+is_cupti_tool = (
+    '--skip-device-check' in sys.argv or
+    '--skip-vllm-import' in sys.argv or
+    '--skip-sync' in sys.argv or
+    '--skip-fa3-check' in sys.argv or
+    any('cupti' in env.lower() for env in os.environ.keys()) or
+    any('nvbit' in env.lower() for env in os.environ.keys()) or
+    any('ncu' in env.lower() for env in os.environ.keys()) or
+    'CUPTI' in os.environ or
+    'NVPROF' in os.environ
+)
+
+# For CUPTI tools, delay torch import until after args parsing
+# This allows CUPTI to initialize before CUDA context creation
+if not is_cupti_tool:
+    import torch
+    import torch.utils.benchmark as benchmark
+else:
+    # Set to None initially, will import after args parsing
+    torch = None
+    benchmark = None
 
 # Remove local flash-attention directory from path to avoid circular import
 # We want to import from vLLM installation, not the local source
@@ -20,94 +41,118 @@ parent_dir = str(Path(__file__).parent.parent)
 if parent_dir in sys.path:
     sys.path.remove(parent_dir)
 
-# Try to import from vLLM installation (where the extension is built)
-vllm_venv_paths = [
-    # os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
-    os.path.expanduser("~/vllm-10-2-orig-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
-    # os.path.expanduser("~/vllm-12-0-venv/lib/python3.12/site-packages/vllm/"),
-    # os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm/"),
-]
+# Check if we're running under a CUPTI tool (need to delay CUDA context creation)
+# CUPTI tools need to initialize before any CUDA context is created
+is_cupti_tool = (
+    '--skip-device-check' in sys.argv or
+    '--skip-vllm-import' in sys.argv or
+    '--skip-sync' in sys.argv or
+    '--skip-fa3-check' in sys.argv or
+    any('cupti' in env.lower() for env in os.environ.keys()) or
+    any('nvbit' in env.lower() for env in os.environ.keys()) or
+    any('ncu' in env.lower() for env in os.environ.keys()) or
+    'CUPTI' in os.environ or
+    'NVPROF' in os.environ
+)
 
+# For CUPTI tools, delay vLLM flash attention import until after args parsing
+# This allows CUPTI to initialize before CUDA context creation
 fa3_imported = False
 import_source = None
+flash_attn_varlen_func = None
+get_scheduler_metadata = None
+FA3_AVAILABLE = None
+FA3_UNAVAILABLE_REASON = None
+is_fa_version_supported = None
+fa_version_unsupported_reason = None
+reshape_and_cache_flash_available = False
+reshape_and_cache_flash_func = None
 
-for vllm_path in vllm_venv_paths:
-    expanded_path = os.path.expanduser(vllm_path) if vllm_path.startswith("~") else vllm_path
-    if not os.path.exists(expanded_path):
-        continue
+if not is_cupti_tool:
+    # Normal import path (not using CUPTI)
+    vllm_venv_paths = [
+        # os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
+        os.path.expanduser("~/vllm-10-2-orig-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
+        # os.path.expanduser("~/vllm-12-0-venv/lib/python3.12/site-packages/vllm/"),
+        # os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm/"),
+    ]
     
-    try:
-        # Add path to sys.path if not already there
-        if expanded_path not in sys.path:
-            sys.path.insert(0, expanded_path)
-        # Remove any cached modules to force fresh import
-        if 'vllm_flash_attn' in sys.modules:
-            del sys.modules['vllm_flash_attn']
-        if 'vllm_flash_attn.flash_attn_interface' in sys.modules:
-            del sys.modules['vllm_flash_attn.flash_attn_interface']
+    for vllm_path in vllm_venv_paths:
+        expanded_path = os.path.expanduser(vllm_path) if vllm_path.startswith("~") else vllm_path
+        if not os.path.exists(expanded_path):
+            continue
         
-        from vllm_flash_attn.flash_attn_interface import (
-            flash_attn_varlen_func,
-            get_scheduler_metadata,
-            FA3_AVAILABLE,
-            FA3_UNAVAILABLE_REASON,
-            is_fa_version_supported,
-            fa_version_unsupported_reason,
-        )
-        # Import reshape_and_cache_flash to simulate vLLM's cache write
-        reshape_and_cache_flash_available = False
-        reshape_and_cache_flash_func = None
-        
-        # Check if we should skip vllm import (useful for nvbit)
-        skip_vllm_import = '--skip-vllm-import' in sys.argv
-        
-        if not skip_vllm_import:
-            try:
-                from vllm import _custom_ops as ops
-                if hasattr(ops, 'reshape_and_cache_flash'):
-                    reshape_and_cache_flash_func = ops.reshape_and_cache_flash
-                    reshape_and_cache_flash_available = True
-                    print(f"Found reshape_and_cache_flash in vllm._custom_ops")
-            except ImportError:
-                pass
-            except Exception:
-                pass
+        try:
+            # Add path to sys.path if not already there
+            if expanded_path not in sys.path:
+                sys.path.insert(0, expanded_path)
+            # Remove any cached modules to force fresh import
+            if 'vllm_flash_attn' in sys.modules:
+                del sys.modules['vllm_flash_attn']
+            if 'vllm_flash_attn.flash_attn_interface' in sys.modules:
+                del sys.modules['vllm_flash_attn.flash_attn_interface']
             
-            if not reshape_and_cache_flash_available:
+            from vllm_flash_attn.flash_attn_interface import (
+                flash_attn_varlen_func,
+                get_scheduler_metadata,
+                FA3_AVAILABLE,
+                FA3_UNAVAILABLE_REASON,
+                is_fa_version_supported,
+                fa_version_unsupported_reason,
+            )
+            # Import reshape_and_cache_flash to simulate vLLM's cache write
+            skip_vllm_import = '--skip-vllm-import' in sys.argv
+            
+            if not skip_vllm_import:
                 try:
-                    from vllm.attention.utils.fa_utils import reshape_and_cache_flash
-                    reshape_and_cache_flash_func = reshape_and_cache_flash
-                    reshape_and_cache_flash_available = True
-                    print(f"Found reshape_and_cache_flash in vllm.attention.utils.fa_utils")
+                    from vllm import _custom_ops as ops
+                    if hasattr(ops, 'reshape_and_cache_flash'):
+                        reshape_and_cache_flash_func = ops.reshape_and_cache_flash
+                        reshape_and_cache_flash_available = True
+                        print(f"Found reshape_and_cache_flash in vllm._custom_ops")
                 except ImportError:
-                    print("Warning: reshape_and_cache_flash not available - cannot simulate vLLM cache write")
+                    pass
                 except Exception:
                     pass
-        
-        fa3_imported = True
-        import_source = expanded_path
-        break
-    except ImportError as e:
-        print(f"Failed to import FA3 from {expanded_path}")
-        print(f"Reason: {e}")
-        continue
-
-# If not found in vLLM paths, raise error
-if not fa3_imported:
-    raise ImportError(
-        "FA3 CUDA extension (_vllm_fa3_C) could not be imported.\n"
-        "Tried paths:\n" + "\n".join(f"  {p}" for p in vllm_venv_paths) + "\n"
-        "Please ensure:\n"
-        "  1. The vLLM environment is activated\n"
-        "  2. The extension is built in one of the above paths\n"
-        "  3. The extension module _vllm_fa3_C.so exists"
-    )
-
-# Verify FA3 is available (but device capability check happens in main() after args parsing)
-if not FA3_AVAILABLE:
-    raise ImportError(
-        f"FA3 CUDA extension is not available: {FA3_UNAVAILABLE_REASON}"
-    )
+                
+                if not reshape_and_cache_flash_available:
+                    try:
+                        from vllm.attention.utils.fa_utils import reshape_and_cache_flash
+                        reshape_and_cache_flash_func = reshape_and_cache_flash
+                        reshape_and_cache_flash_available = True
+                        print(f"Found reshape_and_cache_flash in vllm.attention.utils.fa_utils")
+                    except ImportError:
+                        print("Warning: reshape_and_cache_flash not available - cannot simulate vLLM cache write")
+                    except Exception:
+                        pass
+            
+            fa3_imported = True
+            import_source = expanded_path
+            break
+        except ImportError as e:
+            print(f"Failed to import FA3 from {expanded_path}")
+            print(f"Reason: {e}")
+            continue
+    
+    # If not found in vLLM paths, raise error
+    if not fa3_imported:
+        raise ImportError(
+            "FA3 CUDA extension (_vllm_fa3_C) could not be imported.\n"
+            "Tried paths:\n" + "\n".join(f"  {p}" for p in vllm_venv_paths) + "\n"
+            "Please ensure:\n"
+            "  1. The vLLM environment is activated\n"
+            "  2. The extension is built in one of the above paths\n"
+            "  3. The extension module _vllm_fa3_C.so exists"
+        )
+    
+    # Verify FA3 is available
+    if not FA3_AVAILABLE:
+        raise ImportError(
+            f"FA3 CUDA extension is not available: {FA3_UNAVAILABLE_REASON}"
+        )
+else:
+    # CUPTI tool detected - delay import until after args parsing
+    print("CUPTI tool detected - delaying vLLM flash attention import until after CUPTI initialization")
 
 
 def thrash_l2_cache(device='cuda', skip_sync=False):
@@ -349,8 +394,111 @@ def main():
                         help='Skip importing vllm._custom_ops (useful when using nvbit or other CUDA instrumentation tools that may hang during vllm import)')
     parser.add_argument('--skip-sync', action='store_true',
                         help='Skip all torch.cuda.synchronize() calls (required for CUPTI tools like nvbit, ncu, etc. that can hang on synchronize)')
+    parser.add_argument('--skip-fa3-check', action='store_true',
+                        help='Skip FA3 availability check at import time (required for CUPTI tools that need to initialize before CUDA context creation)')
     
     args = parser.parse_args()
+    
+    # For CUPTI tools, import torch now (after CUPTI has initialized)
+    global torch, benchmark
+    if torch is None:
+        import torch
+        import torch.utils.benchmark as benchmark
+    
+    # For CUPTI tools, import vLLM flash attention NOW (after CUPTI has initialized)
+    global fa3_imported, import_source, flash_attn_varlen_func, get_scheduler_metadata
+    global FA3_AVAILABLE, FA3_UNAVAILABLE_REASON, is_fa_version_supported, fa_version_unsupported_reason
+    global reshape_and_cache_flash_available, reshape_and_cache_flash_func
+    
+    if not fa3_imported:
+        print("Importing vLLM flash attention (delayed for CUPTI compatibility)...")
+        vllm_venv_paths = [
+            # os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
+            os.path.expanduser("~/vllm-10-2-orig-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
+            # os.path.expanduser("~/vllm-12-0-venv/lib/python3.12/site-packages/vllm/"),
+            # os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm/"),
+        ]
+        
+        for vllm_path in vllm_venv_paths:
+            expanded_path = os.path.expanduser(vllm_path) if vllm_path.startswith("~") else vllm_path
+            if not os.path.exists(expanded_path):
+                continue
+            
+            try:
+                # Add path to sys.path if not already there
+                if expanded_path not in sys.path:
+                    sys.path.insert(0, expanded_path)
+                # Remove any cached modules to force fresh import
+                if 'vllm_flash_attn' in sys.modules:
+                    del sys.modules['vllm_flash_attn']
+                if 'vllm_flash_attn.flash_attn_interface' in sys.modules:
+                    del sys.modules['vllm_flash_attn.flash_attn_interface']
+                
+                from vllm_flash_attn.flash_attn_interface import (
+                    flash_attn_varlen_func,
+                    get_scheduler_metadata,
+                    FA3_AVAILABLE,
+                    FA3_UNAVAILABLE_REASON,
+                    is_fa_version_supported,
+                    fa_version_unsupported_reason,
+                )
+                # Import reshape_and_cache_flash to simulate vLLM's cache write
+                skip_vllm_import = args.skip_vllm_import
+                
+                if not skip_vllm_import:
+                    try:
+                        from vllm import _custom_ops as ops
+                        if hasattr(ops, 'reshape_and_cache_flash'):
+                            reshape_and_cache_flash_func = ops.reshape_and_cache_flash
+                            reshape_and_cache_flash_available = True
+                            print(f"Found reshape_and_cache_flash in vllm._custom_ops")
+                    except ImportError:
+                        pass
+                    except Exception:
+                        pass
+                    
+                    if not reshape_and_cache_flash_available:
+                        try:
+                            from vllm.attention.utils.fa_utils import reshape_and_cache_flash
+                            reshape_and_cache_flash_func = reshape_and_cache_flash
+                            reshape_and_cache_flash_available = True
+                            print(f"Found reshape_and_cache_flash in vllm.attention.utils.fa_utils")
+                        except ImportError:
+                            print("Warning: reshape_and_cache_flash not available - cannot simulate vLLM cache write")
+                        except Exception:
+                            pass
+                
+                fa3_imported = True
+                import_source = expanded_path
+                break
+            except ImportError as e:
+                print(f"Failed to import FA3 from {expanded_path}")
+                print(f"Reason: {e}")
+                continue
+        
+        # If not found in vLLM paths, raise error
+        if not fa3_imported:
+            raise ImportError(
+                "FA3 CUDA extension (_vllm_fa3_C) could not be imported.\n"
+                "Tried paths:\n" + "\n".join(f"  {p}" for p in vllm_venv_paths) + "\n"
+                "Please ensure:\n"
+                "  1. The vLLM environment is activated\n"
+                "  2. The extension is built in one of the above paths\n"
+                "  3. The extension module _vllm_fa3_C.so exists"
+            )
+        
+        # Verify FA3 is available
+        if not FA3_AVAILABLE:
+            raise ImportError(
+                f"FA3 CUDA extension is not available: {FA3_UNAVAILABLE_REASON}"
+            )
+    
+    # Verify FA3 is available after args parsing (for CUPTI compatibility)
+    # This allows CUPTI to initialize before we check FA3 availability (which may query CUDA)
+    if args.skip_fa3_check and not FA3_AVAILABLE:
+        raise ImportError(
+            f"FA3 CUDA extension is not available: {FA3_UNAVAILABLE_REASON}"
+        )
     
     # Verify FA3 device support (after args parsing so we can use --skip-device-check)
     # This check calls torch.cuda.get_device_capability() which can hang when CUDA

@@ -1,14 +1,6 @@
 """
 Benchmark script for forward-only attention on Hopper GPU (FA3).
 This script measures inference performance using flash_attn_varlen_func with fa_version=3.
-
-CUPTI Compatibility:
-  For Accel-Sim pm_sampling and other CUPTI tools, use --cupti-delay flag:
-    python script.py --cupti-delay 2.0 [other args...]
-  
-  This delays CUDA initialization to allow CUPTI tools to configure metrics first.
-  The error "CUPTI_ERROR_INVALID_PARAMETER" from pm_sampling.h occurs when a CUDA
-  context is created before CUPTI can finish configuring metrics.
 """
 import argparse
 import math
@@ -16,40 +8,11 @@ import sys
 import os
 from pathlib import Path
 
-# CRITICAL FOR ACCEL-SIM: Check for early delay request before any CUDA-related imports
-# This must happen BEFORE importing torch or any CUDA libraries
-# Accel-Sim pm_sampling needs to configure CUPTI metrics before any CUDA context exists
-if '--cupti-delay-early' in sys.argv:
-    import time
-    delay_idx = sys.argv.index('--cupti-delay-early')
-    if delay_idx + 1 < len(sys.argv):
-        try:
-            early_delay = float(sys.argv[delay_idx + 1])
-            print(f"Early CUPTI delay: waiting {early_delay} seconds before any imports...")
-            time.sleep(early_delay)
-            print("Early delay complete, proceeding with imports...")
-        except (ValueError, IndexError):
-            print("Warning: --cupti-delay-early requires a numeric argument, using default 2.0s")
-            time.sleep(2.0)
-
 # Ensure unbuffered output so print statements are immediately visible
 sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
 
-# ALWAYS delay torch import to ensure CUPTI tools (like Accel-Sim pm_sampling) can initialize first
-# CUPTI tools need to configure metrics before any CUDA context is created
-# Importing torch can trigger CUDA initialization, so we delay it until after args parsing
-# This is critical for Accel-Sim pm_sampling which calls cuptiProfilerHostConfigAddMetrics()
-
-# Prevent PyTorch from initializing CUDA on import by setting environment variable
-# This ensures CUPTI tools can configure metrics before any CUDA context exists
-if 'CUDA_VISIBLE_DEVICES' not in os.environ:
-    # Don't set this if user already specified CUDA_VISIBLE_DEVICES
-    # Setting it to empty string prevents CUDA initialization
-    # But we can't do this unconditionally as it might break things
-    pass
-
-torch = None
-benchmark = None
+import torch
+import torch.utils.benchmark as benchmark
 
 # Remove local flash-attention directory from path to avoid circular import
 # We want to import from vLLM installation, not the local source
@@ -57,98 +20,97 @@ parent_dir = str(Path(__file__).parent.parent)
 if parent_dir in sys.path:
     sys.path.remove(parent_dir)
 
-# ALWAYS delay vLLM flash attention import - we'll import it in main() after args parsing
-# This ensures CUPTI tools (like Accel-Sim's pm_sampling) can initialize before CUDA context creation
+# Try to import from vLLM installation (where the extension is built)
+vllm_venv_paths = [
+    # os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
+    os.path.expanduser("~/vllm-10-2-orig-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
+    # os.path.expanduser("~/vllm-12-0-venv/lib/python3.12/site-packages/vllm/"),
+    # os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm/"),
+]
+
 fa3_imported = False
 import_source = None
-flash_attn_varlen_func = None
-get_scheduler_metadata = None
-FA3_AVAILABLE = None
-FA3_UNAVAILABLE_REASON = None
-is_fa_version_supported = None
-fa_version_unsupported_reason = None
-reshape_and_cache_flash_available = False
-reshape_and_cache_flash_func = None
 
-# Don't import vLLM flash attention here - delay until main() after args parsing
-# This is critical for CUPTI compatibility
-if False:  # Changed to False to always delay import
-    # Normal import path (not using CUPTI)
-    vllm_venv_paths = [
-        # os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
-        os.path.expanduser("~/vllm-10-2-orig-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
-        # os.path.expanduser("~/vllm-12-0-venv/lib/python3.12/site-packages/vllm/"),
-        # os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm/"),
-    ]
+for vllm_path in vllm_venv_paths:
+    expanded_path = os.path.expanduser(vllm_path) if vllm_path.startswith("~") else vllm_path
+    if not os.path.exists(expanded_path):
+        continue
     
-    for vllm_path in vllm_venv_paths:
-        expanded_path = os.path.expanduser(vllm_path) if vllm_path.startswith("~") else vllm_path
-        if not os.path.exists(expanded_path):
-            continue
+    try:
+        # Add path to sys.path if not already there
+        if expanded_path not in sys.path:
+            sys.path.insert(0, expanded_path)
+        # Remove any cached modules to force fresh import
+        if 'vllm_flash_attn' in sys.modules:
+            del sys.modules['vllm_flash_attn']
+        if 'vllm_flash_attn.flash_attn_interface' in sys.modules:
+            del sys.modules['vllm_flash_attn.flash_attn_interface']
         
-        try:
-            # Add path to sys.path if not already there
-            if expanded_path not in sys.path:
-                sys.path.insert(0, expanded_path)
-            # Remove any cached modules to force fresh import
-            if 'vllm_flash_attn' in sys.modules:
-                del sys.modules['vllm_flash_attn']
-            if 'vllm_flash_attn.flash_attn_interface' in sys.modules:
-                del sys.modules['vllm_flash_attn.flash_attn_interface']
+        from vllm_flash_attn.flash_attn_interface import (
+            flash_attn_varlen_func,
+            get_scheduler_metadata,
+            FA3_AVAILABLE,
+            FA3_UNAVAILABLE_REASON,
+            is_fa_version_supported,
+            fa_version_unsupported_reason,
+        )
+        # Import reshape_and_cache_flash to simulate vLLM's cache write
+        reshape_and_cache_flash_available = False
+        reshape_and_cache_flash_func = None
+        
+        # Check if we should skip vllm import (useful for nvbit)
+        skip_vllm_import = '--skip-vllm-import' in sys.argv
+        
+        if not skip_vllm_import:
+            try:
+                from vllm import _custom_ops as ops
+                if hasattr(ops, 'reshape_and_cache_flash'):
+                    reshape_and_cache_flash_func = ops.reshape_and_cache_flash
+                    reshape_and_cache_flash_available = True
+                    print(f"Found reshape_and_cache_flash in vllm._custom_ops")
+            except ImportError:
+                pass
+            except Exception:
+                pass
             
-            from vllm_flash_attn.flash_attn_interface import (
-                flash_attn_varlen_func,
-                get_scheduler_metadata,
-                FA3_AVAILABLE,
-                FA3_UNAVAILABLE_REASON,
-                is_fa_version_supported,
-                fa_version_unsupported_reason,
-            )
-            # Import reshape_and_cache_flash to simulate vLLM's cache write
-            skip_vllm_import = '--skip-vllm-import' in sys.argv
-            
-            if not skip_vllm_import:
+            if not reshape_and_cache_flash_available:
                 try:
-                    from vllm import _custom_ops as ops
-                    if hasattr(ops, 'reshape_and_cache_flash'):
-                        reshape_and_cache_flash_func = ops.reshape_and_cache_flash
-                        reshape_and_cache_flash_available = True
-                        print(f"Found reshape_and_cache_flash in vllm._custom_ops")
+                    from vllm.attention.utils.fa_utils import reshape_and_cache_flash
+                    reshape_and_cache_flash_func = reshape_and_cache_flash
+                    reshape_and_cache_flash_available = True
+                    print(f"Found reshape_and_cache_flash in vllm.attention.utils.fa_utils")
                 except ImportError:
-                    pass
+                    print("Warning: reshape_and_cache_flash not available - cannot simulate vLLM cache write")
                 except Exception:
                     pass
-                
-                if not reshape_and_cache_flash_available:
-                    try:
-                        from vllm.attention.utils.fa_utils import reshape_and_cache_flash
-                        reshape_and_cache_flash_func = reshape_and_cache_flash
-                        reshape_and_cache_flash_available = True
-                        print(f"Found reshape_and_cache_flash in vllm.attention.utils.fa_utils")
-                    except ImportError:
-                        print("Warning: reshape_and_cache_flash not available - cannot simulate vLLM cache write")
-                    except Exception:
-                        pass
-            
-            fa3_imported = True
-            import_source = expanded_path
-            break
-        except ImportError as e:
-            print(f"Failed to import FA3 from {expanded_path}")
-            print(f"Reason: {e}")
-            continue
-    
-    # If not found in vLLM paths, raise error (but only if we tried to import)
-    if not fa3_imported:
-        # Don't raise error here - we'll import in main() instead
-        pass
-else:
-    # Always delay import - will happen in main() after args parsing
-    # This ensures CUPTI tools can initialize before CUDA context creation
-    pass
+        
+        fa3_imported = True
+        import_source = expanded_path
+        break
+    except ImportError:
+        print(f"Failed to import FA3 from {expanded_path}")
+        print(f"Reason: {e}")
+        continue
+
+# If not found in vLLM paths, raise error
+if not fa3_imported:
+    raise ImportError(
+        "FA3 CUDA extension (_vllm_fa3_C) could not be imported.\n"
+        "Tried paths:\n" + "\n".join(f"  {p}" for p in vllm_venv_paths) + "\n"
+        "Please ensure:\n"
+        "  1. The vLLM environment is activated\n"
+        "  2. The extension is built in one of the above paths\n"
+        "  3. The extension module _vllm_fa3_C.so exists"
+    )
+
+# Verify FA3 is available (but device capability check happens in main() after args parsing)
+if not FA3_AVAILABLE:
+    raise ImportError(
+        f"FA3 CUDA extension is not available: {FA3_UNAVAILABLE_REASON}"
+    )
 
 
-def thrash_l2_cache(device='cuda', skip_sync=False):
+def thrash_l2_cache(device='cuda'):
     """Thrash the GPU L2 cache by allocating and accessing large amounts of memory.
     
     This function allocates tensors large enough to fill the L2 cache multiple times
@@ -157,7 +119,6 @@ def thrash_l2_cache(device='cuda', skip_sync=False):
     
     Args:
         device: The CUDA device to use (default: 'cuda')
-        skip_sync: If True, skip torch.cuda.synchronize() call (for CUPTI compatibility)
     
     Note:
         - Hopper GPUs (H100) have ~50MB L2 cache
@@ -191,15 +152,14 @@ def thrash_l2_cache(device='cuda', skip_sync=False):
         # Write operation with different pattern
         tensor.fill_(1)
     
-    # Synchronize to ensure all operations complete (skip if CUPTI is active)
-    if not skip_sync:
-        torch.cuda.synchronize()
+    # Synchronize to ensure all operations complete
+    torch.cuda.synchronize()
     
     # Clean up (tensors will be garbage collected)
     del flush_tensors
 
 
-def benchmark_forward(fn, *inputs, repeats=10, desc="", verbose=True, flush_cache=False, warmup=True, skip_sync=False, **kwinputs):
+def benchmark_forward(fn, *inputs, repeats=10, desc="", verbose=True, flush_cache=False, warmup=True, **kwinputs):
     """Use Pytorch Benchmark on the forward pass of an arbitrary function.
     
     Args:
@@ -210,7 +170,6 @@ def benchmark_forward(fn, *inputs, repeats=10, desc="", verbose=True, flush_cach
         verbose: Whether to print timing information
         flush_cache: If True, thrash L2 cache before each run to ensure cold cache
         warmup: If True, perform warmup runs before timing (default: True)
-        skip_sync: If True, skip all torch.cuda.synchronize() calls (for CUPTI compatibility)
         **kwinputs: Keyword arguments for fn
     """
     if verbose:
@@ -221,14 +180,14 @@ def benchmark_forward(fn, *inputs, repeats=10, desc="", verbose=True, flush_cach
         # Do one warmup run (if enabled)
         if warmup:
             if flush_cache and torch.cuda.is_available():
-                thrash_l2_cache(device='cuda', skip_sync=skip_sync)
+                thrash_l2_cache(device='cuda')
             fn(*inputs, **kwinputs)
-            if torch.cuda.is_available() and not skip_sync:
+            if torch.cuda.is_available():
                 torch.cuda.synchronize()
         
         # Single timed run
         if flush_cache and torch.cuda.is_available():
-            thrash_l2_cache(device='cuda', skip_sync=skip_sync)
+            thrash_l2_cache(device='cuda')
         start_event = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
         end_event = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
         
@@ -242,8 +201,7 @@ def benchmark_forward(fn, *inputs, repeats=10, desc="", verbose=True, flush_cach
         
         if torch.cuda.is_available():
             end_event.record()
-            if not skip_sync:
-                torch.cuda.synchronize()
+            torch.cuda.synchronize()
             elapsed_time = start_event.elapsed_time(end_event) / 1000.0  # Convert ms to seconds
         else:
             elapsed_time = time_module.perf_counter() - start_time
@@ -267,16 +225,16 @@ def benchmark_forward(fn, *inputs, repeats=10, desc="", verbose=True, flush_cach
     num_warmup = 0
     for _ in range(num_warmup):
         if flush_cache and torch.cuda.is_available():
-            thrash_l2_cache(device='cuda', skip_sync=skip_sync)
+            thrash_l2_cache(device='cuda')
         fn(*inputs, **kwinputs)
-    if torch.cuda.is_available() and not skip_sync:
+    if torch.cuda.is_available():
         torch.cuda.synchronize()
     
     # Create a wrapper function that thrashes L2 cache before each call
     if flush_cache:
         def wrapped_fn(*args, **kwargs):
             if torch.cuda.is_available():
-                thrash_l2_cache(device='cuda', skip_sync=skip_sync)
+                thrash_l2_cache(device='cuda')
             return fn(*args, **kwargs)
         timer_fn = wrapped_fn
     else:
@@ -333,7 +291,7 @@ def efficiency(flop, time):
     return (flop / time / 10**12) if not math.isnan(time) and time > 0 else 0.0
 
 
-def time_forward(func, *args, flush_cache=False, warmup=True, skip_sync=False, **kwargs):
+def time_forward(func, *args, flush_cache=False, warmup=True, **kwargs):
     """Benchmark forward pass only.
     
     Args:
@@ -341,13 +299,12 @@ def time_forward(func, *args, flush_cache=False, warmup=True, skip_sync=False, *
         *args: Positional arguments for func
         flush_cache: If True, thrash L2 cache before each run to ensure cold cache
         warmup: If True, perform warmup runs before timing (default: True)
-        skip_sync: If True, skip all torch.cuda.synchronize() calls (for CUPTI compatibility)
         **kwargs: Keyword arguments for func (repeats, verbose, etc.)
     
     Returns:
         Mean forward time in seconds
     """
-    time_f = benchmark_forward(func, *args, flush_cache=flush_cache, warmup=warmup, skip_sync=skip_sync, **kwargs)
+    time_f = benchmark_forward(func, *args, flush_cache=flush_cache, warmup=warmup, **kwargs)
     return time_f[1].mean
 
 
@@ -385,182 +342,15 @@ def main():
                         help='Skip device capability check (used when using nvbit or other CUDA instrumentation tools that may hang on CUDA API calls)')
     parser.add_argument('--skip-vllm-import', action='store_true',
                         help='Skip importing vllm._custom_ops (useful when using nvbit or other CUDA instrumentation tools that may hang during vllm import)')
-    parser.add_argument('--skip-sync', action='store_true',
-                        help='Skip all torch.cuda.synchronize() calls (required for CUPTI tools like nvbit, ncu, etc. that can hang on synchronize)')
-    parser.add_argument('--skip-fa3-check', action='store_true',
-                        help='Skip FA3 availability check at import time (required for CUPTI tools that need to initialize before CUDA context creation)')
-    parser.add_argument('--cupti-delay', type=float, default=0.0,
-                        help='Delay in seconds before importing CUDA libraries (for Accel-Sim pm_sampling compatibility, try 1.0-2.0)')
     
     args = parser.parse_args()
-    
-    # Import torch now (after CUPTI has initialized if using CUPTI tools)
-    global torch, benchmark
-    if torch is None:
-        # For Accel-Sim pm_sampling: ensure CUPTI has finished configuring metrics
-        # before we create any CUDA context. Accel-Sim's pm_sampling configures CUPTI
-        # metrics at startup, and this must complete before any CUDA context exists.
-        # The error CUPTI_ERROR_INVALID_PARAMETER from cuptiProfilerHostConfigAddMetrics
-        # occurs when CUPTI tries to configure metrics after a CUDA context exists.
-        import time
-        
-        # Check if we're likely running under Accel-Sim pm_sampling
-        # Accel-Sim typically sets certain environment variables or we can detect it
-        # by checking if CUPTI-related flags are present
-        is_accel_sim = (
-            'ACCEL_SIM' in os.environ or
-            'pm_sampling' in str(sys.argv).lower() or
-            any('accel' in env.lower() for env in os.environ.keys())
-        )
-        
-        # Check if we're running under a CUPTI tool (for informational purposes)
-        is_cupti_tool = (
-            args.skip_device_check or
-            args.skip_vllm_import or
-            args.skip_sync or
-            args.skip_fa3_check or
-            args.cupti_delay > 0 or
-            any('cupti' in env.lower() for env in os.environ.keys()) or
-            any('nvbit' in env.lower() for env in os.environ.keys()) or
-            any('ncu' in env.lower() for env in os.environ.keys()) or
-            'CUPTI' in os.environ or
-            'NVPROF' in os.environ
-        )
-        
-        # Use user-specified delay or auto-detect delay for CUPTI tools
-        delay_time = args.cupti_delay if hasattr(args, 'cupti_delay') else 0.0
-        if delay_time > 0:
-            print(f"Delaying CUDA initialization by {delay_time} seconds for CUPTI compatibility...")
-            time.sleep(delay_time)
-            print("CUDA initialization delay complete, proceeding with imports...")
-        elif is_accel_sim or is_cupti_tool:
-            # Give CUPTI/pm_sampling more time to finish metric configuration
-            # Accel-Sim's pm_sampling needs to call cuptiProfilerHostConfigAddMetrics
-            # before any CUDA context is created
-            print("Detected CUPTI tool (Accel-Sim pm_sampling) - delaying CUDA initialization...")
-            time.sleep(1.0)  # 1 second delay to let CUPTI/pm_sampling finish initialization
-            print("CUDA initialization delay complete, proceeding with imports...")
-        
-        # CRITICAL: Import torch WITHOUT triggering CUDA initialization
-        # Set environment variable to prevent CUDA init if not already set
-        # This gives Accel-Sim pm_sampling time to configure CUPTI metrics
-        original_cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
-        
-        # Temporarily prevent CUDA initialization during import
-        # Note: This is a workaround - ideally CUPTI would signal when ready
-        try:
-            import torch
-            import torch.utils.benchmark as benchmark
-            
-            # CRITICAL: Do NOT call torch.cuda.is_available() here!
-            # Even checking CUDA availability can create a CUDA context,
-            # which will interfere with Accel-Sim's pm_sampling CUPTI configuration.
-            # The CUDA context will be created naturally when we create tensors later.
-        except Exception as e:
-            print(f"Warning: Error importing torch: {e}")
-            raise
-    
-    # Import vLLM flash attention NOW (after CUPTI has initialized if using CUPTI tools)
-    global fa3_imported, import_source, flash_attn_varlen_func, get_scheduler_metadata
-    global FA3_AVAILABLE, FA3_UNAVAILABLE_REASON, is_fa_version_supported, fa_version_unsupported_reason
-    global reshape_and_cache_flash_available, reshape_and_cache_flash_func
-    
-    if not fa3_imported:
-        print("Importing vLLM flash attention (delayed for CUPTI compatibility)...")
-        vllm_venv_paths = [
-            # os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
-            os.path.expanduser("~/vllm-10-2-orig-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
-            # os.path.expanduser("~/vllm-12-0-venv/lib/python3.12/site-packages/vllm/"),
-            # os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm/"),
-        ]
-        
-        for vllm_path in vllm_venv_paths:
-            expanded_path = os.path.expanduser(vllm_path) if vllm_path.startswith("~") else vllm_path
-            if not os.path.exists(expanded_path):
-                continue
-            
-            try:
-                # Add path to sys.path if not already there
-                if expanded_path not in sys.path:
-                    sys.path.insert(0, expanded_path)
-                # Remove any cached modules to force fresh import
-                if 'vllm_flash_attn' in sys.modules:
-                    del sys.modules['vllm_flash_attn']
-                if 'vllm_flash_attn.flash_attn_interface' in sys.modules:
-                    del sys.modules['vllm_flash_attn.flash_attn_interface']
-                
-                from vllm_flash_attn.flash_attn_interface import (
-                    flash_attn_varlen_func,
-                    get_scheduler_metadata,
-                    FA3_AVAILABLE,
-                    FA3_UNAVAILABLE_REASON,
-                    is_fa_version_supported,
-                    fa_version_unsupported_reason,
-                )
-                # Import reshape_and_cache_flash to simulate vLLM's cache write
-                skip_vllm_import = args.skip_vllm_import
-                
-                if not skip_vllm_import:
-                    try:
-                        from vllm import _custom_ops as ops
-                        if hasattr(ops, 'reshape_and_cache_flash'):
-                            reshape_and_cache_flash_func = ops.reshape_and_cache_flash
-                            reshape_and_cache_flash_available = True
-                            print(f"Found reshape_and_cache_flash in vllm._custom_ops")
-                    except ImportError:
-                        pass
-                    except Exception:
-                        pass
-                    
-                    if not reshape_and_cache_flash_available:
-                        try:
-                            from vllm.attention.utils.fa_utils import reshape_and_cache_flash
-                            reshape_and_cache_flash_func = reshape_and_cache_flash
-                            reshape_and_cache_flash_available = True
-                            print(f"Found reshape_and_cache_flash in vllm.attention.utils.fa_utils")
-                        except ImportError:
-                            print("Warning: reshape_and_cache_flash not available - cannot simulate vLLM cache write")
-                        except Exception:
-                            pass
-                
-                fa3_imported = True
-                import_source = expanded_path
-                break
-            except ImportError as e:
-                print(f"Failed to import FA3 from {expanded_path}")
-                print(f"Reason: {e}")
-                continue
-        
-        # If not found in vLLM paths, raise error
-        if not fa3_imported:
-            raise ImportError(
-                "FA3 CUDA extension (_vllm_fa3_C) could not be imported.\n"
-                "Tried paths:\n" + "\n".join(f"  {p}" for p in vllm_venv_paths) + "\n"
-                "Please ensure:\n"
-                "  1. The vLLM environment is activated\n"
-                "  2. The extension is built in one of the above paths\n"
-                "  3. The extension module _vllm_fa3_C.so exists"
-            )
-        
-        # Verify FA3 is available
-        if not FA3_AVAILABLE:
-            raise ImportError(
-                f"FA3 CUDA extension is not available: {FA3_UNAVAILABLE_REASON}"
-            )
-    
-    # Verify FA3 is available after args parsing (for CUPTI compatibility)
-    # This allows CUPTI to initialize before we check FA3 availability (which may query CUDA)
-    if args.skip_fa3_check and not FA3_AVAILABLE:
-        raise ImportError(
-            f"FA3 CUDA extension is not available: {FA3_UNAVAILABLE_REASON}"
-        )
     
     # Verify FA3 device support (after args parsing so we can use --skip-device-check)
     # This check calls torch.cuda.get_device_capability() which can hang when CUDA
     # instrumentation tools like nvbit are active, so we allow skipping it
     if not args.skip_device_check:
-        # Synchronize CUDA before checking device capability (skip if CUPTI is active)
-        if torch.cuda.is_available() and not args.skip_sync:
+        # Synchronize CUDA before checking device capability
+        if torch.cuda.is_available():
             try:
                 torch.cuda.synchronize()
             except Exception:
@@ -1300,8 +1090,7 @@ def main():
                     v_scale,
                 )
                 print(f"✓ reshape_and_cache_flash completed")
-                if not args.skip_sync:
-                    torch.cuda.synchronize()  # Ensure cache write completes before attention
+                torch.cuda.synchronize()  # Ensure cache write completes before attention
             else:
                 print("Error: reshape_and_cache_flash_func is None")
         except Exception as e:
@@ -1383,7 +1172,6 @@ def main():
             flash_attn_varlen_func,
             flush_cache=args.flush_cache,
             warmup=not args.no_warmup,
-            skip_sync=args.skip_sync,
             **func_kwargs
         )
         

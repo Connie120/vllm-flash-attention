@@ -327,6 +327,8 @@ def main():
                         help='Skip warmup runs before timing (default: warmup is enabled)')
     parser.add_argument('--tile-scheduler-debug', action='store_true',
                         help='Enable printf debug output in tile scheduler (default: disabled)')
+    parser.add_argument('--sm-interleaving', action='store_true',
+                        help='Enable SM interleaving for tile scheduler (default: disabled)')
     
     args = parser.parse_args()
     
@@ -379,6 +381,7 @@ def main():
     print(f"Page size: {args.page_size if args.page_size is not None else 'None (no paging)'}")
     print(f"Block allocation: {'Contiguous (sequential)' if args.contiguous_blocks else 'Scattered (non-sequential)'}")
     print(f"Prefill SM percentage: {args.prefill_sm_percentage:.1%} ({args.prefill_sm_percentage*100:.0f}%% prefill, {(1-args.prefill_sm_percentage)*100:.0f}%% decode)")
+    print(f"SM interleaving: {'Enabled' if args.sm_interleaving else 'Disabled'}")
     print("=" * 80)
     
     # ========== Combined Prefill + Decode in single batch ==========
@@ -1116,6 +1119,7 @@ def main():
             'prefill_sm_percentage': args.prefill_sm_percentage,
             'num_prefill_batches': batch_prefill,
             'tile_scheduler_debug': args.tile_scheduler_debug,
+            'sm_interleaving': args.sm_interleaving,
             'repeats': repeats,
             'verbose': True  # Set to True to see Timer output showing all repeats
         }

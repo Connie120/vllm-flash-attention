@@ -23,9 +23,9 @@ if parent_dir in sys.path:
 # Try to import from vLLM installation (where the extension is built)
 vllm_venv_paths = [
     # os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
-    os.path.expanduser("~/vllm-10-2-orig-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
+    #  os.path.expanduser("~/vllm-10-2-orig-venv/lib/python3.11/site-packages/vllm_flash_attn-2.7.2.post1+cu129-py3.11-linux-x86_64.egg/vllm_flash_attn"),
     # os.path.expanduser("~/vllm-12-0-venv/lib/python3.12/site-packages/vllm/"),
-    # os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm/"),
+    os.path.expanduser("~/vllm-10-2-venv/lib/python3.11/site-packages/vllm/"),
 ]
 
 fa3_imported = False
@@ -86,8 +86,22 @@ for vllm_path in vllm_venv_paths:
         
         fa3_imported = True
         import_source = expanded_path
+        
+        # Print which vllm_flash_attn is being used
+        try:
+            import vllm_flash_attn
+            vllm_flash_attn_path = os.path.dirname(vllm_flash_attn.__file__)
+            print(f"=" * 80)
+            print(f"Using vllm_flash_attn from: {vllm_flash_attn_path}")
+            print(f"Import source path: {import_source}")
+            print(f"=" * 80)
+            sys.stdout.flush()
+        except Exception:
+            print(f"Using vllm_flash_attn from: {import_source}")
+            sys.stdout.flush()
+        
         break
-    except ImportError:
+    except ImportError as e:
         print(f"Failed to import FA3 from {expanded_path}")
         print(f"Reason: {e}")
         continue
@@ -342,6 +356,12 @@ def main():
                         help='Skip device capability check (used when using nvbit or other CUDA instrumentation tools that may hang on CUDA API calls)')
     parser.add_argument('--skip-vllm-import', action='store_true',
                         help='Skip importing vllm._custom_ops (useful when using nvbit or other CUDA instrumentation tools that may hang during vllm import)')
+    parser.add_argument('--causal', action='store_true', default=True,
+                        help='Use causal attention masking (default: True)')
+    parser.add_argument('--non-causal', dest='causal', action='store_false',
+                        help='Disable causal attention masking (equivalent to --causal=False)')
+    parser.add_argument('--create-on-device', action='store_true',
+                        help='Create tensors directly on device instead of using .to(device) (avoids CPU-to-GPU transfers)')
     
     args = parser.parse_args()
     
@@ -500,15 +520,74 @@ def main():
     # Always use paged KV format for both prefill and decode
     page_size = args.page_size
     
+    # MANUALLY INITIALIZE CUDA CONTEXT before first tensor operations
+    # NOTE: When nvbit is active, there are two types of initialization delays:
+    # 1. First run ever: nvbit does one-time setup (loading libraries, caching, etc.) - takes 3-4 minutes
+    # 2. Subsequent runs: nvbit uses cached data - much faster
+    # 3. First CUDA operation in each run: triggers nvbit hooks - usually fast after first run
+    # We do this initialization here explicitly so users know what's happening.
+    if torch.cuda.is_available() and device == 'cuda':
+        import time
+        start_time = time.time()
+        
+        # Check if this might be the first nvbit run (slow) or subsequent run (fast)
+        # We can't detect nvbit directly, but we can time the first operation
+        print("DEBUG: Initializing CUDA context...")
+        print("  NOTE: If this is your FIRST nvbit run, it may take 3-4 minutes")
+        print("  Subsequent nvbit runs will be much faster due to caching")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
+        try:
+            # Create a very small tensor on CPU and move to device
+            # This triggers nvbit hooks (slow on first run, fast on subsequent runs)
+            if args.create_on_device:
+                _dummy = torch.tensor([1.0], dtype=torch.float32, device=device)
+            else:
+                _dummy_cpu = torch.tensor([1.0], dtype=torch.float32)
+                _dummy = _dummy_cpu.to(device)
+            # Synchronize to ensure the operation completes
+            torch.cuda.synchronize()
+            elapsed = time.time() - start_time
+            
+            if elapsed > 60:
+                print(f"DEBUG: First CUDA operation took {elapsed:.1f} seconds - this appears to be first nvbit run")
+                print("  (nvbit is doing one-time setup - subsequent runs will be faster)")
+            else:
+                print(f"DEBUG: First CUDA operation took {elapsed:.1f} seconds - using cached nvbit data")
+            sys.stdout.flush()
+            
+            del _dummy, _dummy_cpu
+            
+            # Verify context is ready
+            torch.cuda.set_device(0)
+            torch.cuda.synchronize()
+            
+            total_time = time.time() - start_time
+            print(f"DEBUG: CUDA context initialized in {total_time:.1f} seconds")
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception as e:
+            print(f"DEBUG: Warning - CUDA context initialization had issues: {e}")
+            sys.stdout.flush()
+            sys.stderr.flush()
+    
     # Create Q tensors (vLLM format: [num_tokens, num_heads, head_size])
     # Generate random data on CPU then move to GPU (faster than GPU random generation)
+    # Or create directly on device if --create-on-device flag is set
     if batch_prefill > 0:
-        q_prefill = torch.randn(total_q_prefill, nheads_q, headdim, dtype=dtype).to(device)
+        if args.create_on_device:
+            q_prefill = torch.randn(total_q_prefill, nheads_q, headdim, dtype=dtype, device=device)
+        else:
+            q_prefill = torch.randn(total_q_prefill, nheads_q, headdim, dtype=dtype).to(device)
     else:
         q_prefill = torch.empty(0, nheads_q, headdim, device=device, dtype=dtype)
     
     if batch_decode > 0:
-        q_decode = torch.randn(total_q_decode, nheads_q, headdim, dtype=dtype).to(device)
+        if args.create_on_device:
+            q_decode = torch.randn(total_q_decode, nheads_q, headdim, dtype=dtype, device=device)
+        else:
+            q_decode = torch.randn(total_q_decode, nheads_q, headdim, dtype=dtype).to(device)
     else:
         q_decode = torch.empty(0, nheads_q, headdim, device=device, dtype=dtype)
     
@@ -525,12 +604,20 @@ def main():
         num_blocks_allocated_prefill = num_blocks_total_prefill
         # vLLM format: [2, num_blocks, block_size, num_kv_heads, head_size]
         # Generate random data on CPU then move to GPU (faster than GPU random generation)
-        kv_cache_prefill = torch.randn(2, num_blocks_allocated_prefill, page_size, nheads_kv, headdim, dtype=dtype).to(device)
+        # Or create directly on device if --create-on-device flag is set
+        if args.create_on_device:
+            kv_cache_prefill = torch.randn(2, num_blocks_allocated_prefill, page_size, nheads_kv, headdim, dtype=dtype, device=device)
+        else:
+            kv_cache_prefill = torch.randn(2, num_blocks_allocated_prefill, page_size, nheads_kv, headdim, dtype=dtype).to(device)
         # New K/V tokens for prefill: [num_tokens, num_kv_heads, head_size]
         # Use seqlen_k_prefill for KV tokens (not seqlen_q_prefill)
         total_kv_prefill = batch_prefill * seqlen_k_prefill if batch_prefill > 0 else 0
-        k_prefill_new = torch.randn(total_kv_prefill, nheads_kv, headdim, dtype=dtype).to(device)
-        v_prefill_new = torch.randn(total_kv_prefill, nheads_kv, headdim_v, dtype=dtype).to(device)
+        if args.create_on_device:
+            k_prefill_new = torch.randn(total_kv_prefill, nheads_kv, headdim, dtype=dtype, device=device)
+            v_prefill_new = torch.randn(total_kv_prefill, nheads_kv, headdim_v, dtype=dtype, device=device)
+        else:
+            k_prefill_new = torch.randn(total_kv_prefill, nheads_kv, headdim, dtype=dtype).to(device)
+            v_prefill_new = torch.randn(total_kv_prefill, nheads_kv, headdim_v, dtype=dtype).to(device)
         # Create block_table for prefill: (batch_prefill, max_num_blocks_per_seq_prefill)
         # Simulate scattered memory access by using non-sequential block indices
         # This makes the benchmark more realistic since in real vLLM scenarios, blocks
@@ -661,7 +748,11 @@ def main():
         # KV cache with exact allocation
         # vLLM format: [2, num_blocks, block_size, num_kv_heads, head_size]
         # Generate random data on CPU then move to GPU (faster than GPU random generation)
-        kv_cache_decode = torch.randn(2, num_blocks_allocated_decode, page_size, nheads_kv, headdim, dtype=dtype).to(device)
+        # Or create directly on device if --create-on-device flag is set
+        if args.create_on_device:
+            kv_cache_decode = torch.randn(2, num_blocks_allocated_decode, page_size, nheads_kv, headdim, dtype=dtype, device=device)
+        else:
+            kv_cache_decode = torch.randn(2, num_blocks_allocated_decode, page_size, nheads_kv, headdim, dtype=dtype).to(device)
         
         # Block indices are relative to decode cache [0, num_blocks_allocated_decode - 1]
         # Will be offset by num_blocks_allocated_prefill when combining with prefill cache
@@ -772,26 +863,30 @@ def main():
     # Concatenate Q tensors (vLLM format: [num_tokens, num_heads, head_size])
     q_combined = torch.cat([q_prefill, q_decode], dim=0) if (batch_prefill > 0 or batch_decode > 0) else torch.empty(0, nheads_q, headdim, device=device, dtype=dtype)
     
-    # Combine KV caches: [2, num_blocks_total, block_size, num_kv_heads, head_size]
+    # Keep KV caches separate - do not combine to avoid DRAM-to-L2 loads
+    # For mixed batches, we'll need to handle this differently or accept the copy
+    # For now, keep separate references and only combine when absolutely necessary
     if batch_prefill > 0 and batch_decode > 0:
-        # Mixed batch: combine prefill and decode KV caches
+        # Mixed batch: need combined cache for kernel, but avoid torch.cat()
+        # Use slice assignment into pre-allocated tensor (still causes DRAM loads, but more explicit)
         num_blocks_total = num_blocks_total_prefill + num_blocks_total_decode
-        kv_cache_combined = torch.cat([kv_cache_prefill, kv_cache_decode], dim=1)
-        # New K/V tokens: only prefill has new tokens
+        kv_cache_combined = torch.empty(2, num_blocks_total, page_size, nheads_kv, headdim, device=device, dtype=dtype)
+        kv_cache_combined[:, :num_blocks_total_prefill] = kv_cache_prefill
+        kv_cache_combined[:, num_blocks_total_prefill:] = kv_cache_decode
         k_new_combined = k_prefill_new
         v_new_combined = v_prefill_new
     elif batch_prefill > 0:
-        # Pure prefill with KV cache
+        # Pure prefill: use direct reference (no copy, no DRAM load)
         kv_cache_combined = kv_cache_prefill
         k_new_combined = k_prefill_new
         v_new_combined = v_prefill_new
     elif batch_decode > 0:
-        # Pure decode with KV cache
+        # Pure decode: use direct reference (no copy, no DRAM load)
         kv_cache_combined = kv_cache_decode
         k_new_combined = None
         v_new_combined = None
     else:
-        # Empty batch (shouldn't happen, but handle gracefully)
+        # Empty batch
         kv_cache_combined = torch.empty(2, 0, page_size, nheads_kv, headdim, device=device, dtype=dtype)
         k_new_combined = None
         v_new_combined = None
@@ -876,12 +971,12 @@ def main():
     print(f"  max_seqlen_q_combined: {max_seqlen_q_combined} (from actual sequence lengths)")
     print(f"  max_seqlen_k_combined: {max_seqlen_k_combined} (from actual sequence lengths)")
     
-    # Set causal=True for both decode and prefill
+    # Set causal based on command-line argument
     # Note: For decode with seqlen_q=1, Flash Attention may force causal=False internally
     # (see mha_fwd_kvcache.cpp line 333: if (seqlen_q == 1 && !alibi_slopes) { is_causal = false; })
-    # But we'll set it to True here to match vLLM behavior for mixed batches
+    # But we'll use the user-specified value here
     # (see vllm/v1/worker/gpu_model_runner.py line 1055: causal=True)
-    causal_combined = True
+    causal_combined = args.causal
     print(f"Combined batch: {total_batch} sequences total")
     print(f"  - Prefill: {batch_prefill} sequences, {seqlen_q_prefill} query tokens, {seqlen_k_prefill} KV tokens each")
     print(f"  - Decode: {batch_decode} sequences, {seqlen_q_decode} query tokens, {seqlen_k_decode} context tokens each")
@@ -894,7 +989,7 @@ def main():
         print(f"New K/V tokens: None (decode - tokens already in cache)")
     print(f"nheads-q: {nheads_q}, nheads-kv: {nheads_kv}, "
           f"q_per_kv: {nheads_q // nheads_kv}, "
-          f"causal={causal_combined} (vLLM uses causal=True for both prefill and decode)")
+          f"causal={causal_combined}")
     print(f"Paged KV: ENABLED for all batches (page_size={args.page_size})")
     print(f"  This will preserve is_causal=true for decode with headdim=128 → kBlockN=128")
     
@@ -1066,8 +1161,13 @@ def main():
         else:
             # Create dummy K/V for decode (simulating new tokens being written to cache)
             # Generate random data on CPU then move to GPU (faster than GPU random generation)
-            k_new_for_cache = torch.randn(num_new_tokens, nheads_kv, headdim, dtype=dtype).to(device)
-            v_new_for_cache = torch.randn(num_new_tokens, nheads_kv, headdim_v, dtype=dtype).to(device)
+            # Or create directly on device if --create-on-device flag is set
+            if args.create_on_device:
+                k_new_for_cache = torch.randn(num_new_tokens, nheads_kv, headdim, dtype=dtype, device=device)
+                v_new_for_cache = torch.randn(num_new_tokens, nheads_kv, headdim_v, dtype=dtype, device=device)
+            else:
+                k_new_for_cache = torch.randn(num_new_tokens, nheads_kv, headdim, dtype=dtype).to(device)
+                v_new_for_cache = torch.randn(num_new_tokens, nheads_kv, headdim_v, dtype=dtype).to(device)
             print(f"Created dummy K/V tensors for cache write: shape {k_new_for_cache.shape}")
         
         # Create dummy scale tensors (if FP8, otherwise not used)
@@ -1205,4 +1305,4 @@ def main():
 
 if __name__ == '__main__':
     main()
-
+    

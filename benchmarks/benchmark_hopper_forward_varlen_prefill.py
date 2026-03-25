@@ -362,6 +362,9 @@ def main():
                         help='Disable causal attention masking (equivalent to --causal=False)')
     parser.add_argument('--create-on-device', action='store_true',
                         help='Create tensors directly on device instead of using .to(device) (avoids CPU-to-GPU transfers)')
+    parser.add_argument('--prefix-cache-pct', type=float, default=0.0,
+                        help='Percentage (0-100) of decode context length that is prefix-cached (shared). '
+                             'If > 0, all decode requests prepend the same shared prefix so that portion uses the same memory addresses. Default: 0 (disabled).')
     
     args = parser.parse_args()
     
@@ -430,6 +433,8 @@ def main():
     print(f"nheads-q: {nheads_q}, nheads-kv: {nheads_kv}")
     print(f"Page size: {args.page_size if args.page_size is not None else 'None (no paging)'}")
     print(f"Block allocation: {'Contiguous (sequential)' if args.contiguous_blocks else 'Scattered (non-sequential)'}")
+    prefix_cache_pct = max(0.0, min(100.0, getattr(args, 'prefix_cache_pct', 0.0)))
+    print(f"Prefix caching: {prefix_cache_pct}% of decode context (shared prefix)" if prefix_cache_pct > 0 else "Prefix caching: disabled")
     print("=" * 80)
     
     # ========== Combined Prefill + Decode in single batch ==========
@@ -730,36 +735,53 @@ def main():
         # For decode, we need blocks for existing tokens (seqlen_k_decode) PLUS one more block
         # for the new token being written. So we need ceil(seqlen_k_decode / page_size) blocks
         # for existing tokens, plus 1 more for the new token.
-        max_num_blocks_per_seq_decode = math.ceil(seqlen_k_decode / page_size)
-        # When simulating reshape_and_cache_flash, we need an extra block for the new token
-        # So allocate max_num_blocks_per_seq_decode + 1 blocks per sequence
-        max_num_blocks_per_seq_decode_with_new_token = max_num_blocks_per_seq_decode + 1
-        # Calculate number of blocks needed (including space for new token)
-        num_blocks_total_decode = max_num_blocks_per_seq_decode_with_new_token * batch_decode
+        # When prefix caching is enabled, a percentage of the context is shared: all decode
+        # requests prepend the same blocks so they access the same memory for that portion.
+        use_prefix_caching = prefix_cache_pct > 0
+        if use_prefix_caching:
+            prefix_len = int(seqlen_k_decode * prefix_cache_pct / 100)
+            prefix_len = max(0, min(prefix_len, seqlen_k_decode))
+            num_prefix_blocks = math.ceil(prefix_len / page_size)
+            suffix_len = seqlen_k_decode - prefix_len
+            num_suffix_blocks = math.ceil(suffix_len / page_size)
+            # Shared prefix blocks (one region) + per-request: (num_suffix_blocks + 1) blocks each (suffix + new token)
+            max_num_blocks_per_seq_decode_with_new_token = num_prefix_blocks + num_suffix_blocks + 1
+            num_blocks_allocated_decode = num_prefix_blocks + batch_decode * (num_suffix_blocks + 1)
+            num_blocks_total_decode = num_blocks_allocated_decode
+            max_num_blocks_per_seq_decode = num_prefix_blocks + num_suffix_blocks
+        else:
+            max_num_blocks_per_seq_decode = math.ceil(seqlen_k_decode / page_size)
+            max_num_blocks_per_seq_decode_with_new_token = max_num_blocks_per_seq_decode + 1
+            num_blocks_total_decode = max_num_blocks_per_seq_decode_with_new_token * batch_decode
+            num_blocks_allocated_decode = num_blocks_total_decode
+        
         # For decode, new K/V tokens are None (already in cache)
         k_decode_new = None
         v_decode_new = None
-        # Create block_table for decode: (batch_decode, max_num_blocks_per_seq_decode)
-        # Simulate scattered memory access by using non-sequential block indices
-        # This makes the benchmark more realistic since in real vLLM scenarios, blocks
-        # might not be allocated contiguously due to memory fragmentation.
-        # Allocate exactly the number of blocks needed
-        num_blocks_allocated_decode = num_blocks_total_decode
-        # KV cache with exact allocation
-        # vLLM format: [2, num_blocks, block_size, num_kv_heads, head_size]
-        # Generate random data on CPU then move to GPU (faster than GPU random generation)
-        # Or create directly on device if --create-on-device flag is set
+        
+        # KV cache: vLLM format [2, num_blocks, block_size, num_kv_heads, head_size]
         if args.create_on_device:
             kv_cache_decode = torch.randn(2, num_blocks_allocated_decode, page_size, nheads_kv, headdim, dtype=dtype, device=device)
         else:
             kv_cache_decode = torch.randn(2, num_blocks_allocated_decode, page_size, nheads_kv, headdim, dtype=dtype).to(device)
         
-        # Block indices are relative to decode cache [0, num_blocks_allocated_decode - 1]
-        # Will be offset by num_blocks_allocated_prefill when combining with prefill cache
-        # Use max_num_blocks_per_seq_decode_with_new_token to accommodate new token
+        # Block table: (batch_decode, max_num_blocks_per_seq_decode_with_new_token)
         block_table_decode = torch.zeros(batch_decode, max_num_blocks_per_seq_decode_with_new_token, dtype=torch.int32, device=device)
         
-        if args.contiguous_blocks:
+        if use_prefix_caching:
+            # All decode requests share the first num_prefix_blocks (same memory addresses).
+            # Then each request has its own (num_suffix_blocks + 1) blocks for suffix + new token.
+            for b in range(batch_decode):
+                # Shared prefix block indices: 0, 1, ..., num_prefix_blocks - 1
+                block_table_decode[b, :num_prefix_blocks] = torch.arange(num_prefix_blocks, dtype=torch.int32, device=device)
+                # Per-request blocks: base, base+1, ..., base+num_suffix_blocks (base = num_prefix_blocks + b * (num_suffix_blocks + 1))
+                base = num_prefix_blocks + b * (num_suffix_blocks + 1)
+                block_table_decode[b, num_prefix_blocks:num_prefix_blocks + num_suffix_blocks + 1] = torch.arange(
+                    base, base + num_suffix_blocks + 1, dtype=torch.int32, device=device
+                )
+            print(f"Prefix caching: prefix_len={prefix_len}, num_prefix_blocks={num_prefix_blocks} (shared), "
+                  f"suffix_len={suffix_len}, num_suffix_blocks={num_suffix_blocks} per request")
+        elif args.contiguous_blocks:
             # Sequential (contiguous) block allocation
             block_idx = 0
             for b in range(batch_decode):
